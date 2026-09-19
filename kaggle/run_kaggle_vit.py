@@ -47,14 +47,25 @@ HF_MODEL_DIR = None        # local path to the repo, for a run with internet off
 KEEP_HEAD = True           # reuse the checkpoint's 3-class head (label order matches)
 
 CACHE_H, CACHE_W = 512, 384    # resolution the breast crops are cached at
-MODEL_H, MODEL_W = 384, 288    # what the ViT sees. Its native size is 224x224 and
-                               # interpolate_pos_encoding resamples the position
-                               # embeddings to whatever we pass. 384x288 keeps more
-                               # lesion detail; 224x224 stays closest to how the
-                               # checkpoint was pretrained. Try both, compare OOF.
+
+# Each variant is a full cross-validated run of the same checkpoint, and they are
+# blended at the end. This is the one thing measured to pay here: blending two models
+# that fail differently was worth +0.07 out-of-fold, while every single-model tweak
+# tried came in under 0.02 -- below the 0.023 spread between identical runs.
+#
+# Resolution is what makes them differ. 224x224 is the size this ViT was pretrained
+# at, so its position embeddings are used as-is; 384x288 interpolates them and keeps
+# more of the lesion detail that 224 throws away. The two disagree on different
+# images, which is the whole point. Differing seeds alone would not: averaging two
+# 384x288 runs gave 0.6259, between the two rather than above them.
+#
+# Cut this to one entry if the GPU budget is tight; each costs about 6 minutes.
+VARIANTS = [
+    dict(h=384, w=288, seed=0),
+    dict(h=224, w=224, seed=1),
+]
 
 N_FOLDS = 5
-SEEDS = [0]                # add 1 for a steadier estimate, at double the runtime
 EPOCHS = 12                # ViT-base overfits 212 images fast; more is not better
 BATCH_SIZE = 8
 LR = 3e-5                  # ViT fine-tuning needs a far lower LR than a CNN would
@@ -168,8 +179,9 @@ def rand_affine(img, rng):
 class MammoDataset(Dataset):
     """Geometry-heavy, photometry-light: lesion appearance is the signal."""
 
-    def __init__(self, images, labels, train, seed=0, scale=1.0, flip=False):
+    def __init__(self, images, labels, train, size, seed=0, scale=1.0, flip=False):
         self.images, self.labels, self.train = images, labels, train
+        self.size = size                         # (h, w) this variant wants
         self.scale, self.flip = scale, flip      # fixed transforms, for TTA
         self.rng = np.random.default_rng(seed)
 
@@ -203,8 +215,8 @@ class MammoDataset(Dataset):
                 ch, cw = int(h * self.scale), int(w * self.scale)
                 y0, x0 = (h - ch) // 2, (w - cw) // 2
                 img = img[y0:y0 + ch, x0:x0 + cw]
-        if img.shape != (MODEL_H, MODEL_W):
-            img = cv2.resize(img, (MODEL_W, MODEL_H), interpolation=cv2.INTER_AREA)
+        if img.shape != self.size:
+            img = cv2.resize(img, (self.size[1], self.size[0]), interpolation=cv2.INTER_AREA)
         x = torch.from_numpy(np.ascontiguousarray((img - MEAN) / STD))[None].repeat(3, 1, 1)
         return x if self.labels is None else (x, int(self.labels[i]))
 
@@ -265,13 +277,14 @@ class EMA:
 
 
 @torch.no_grad()
-def predict(model, images):
+def predict(model, images, size):
     """Average over every flip x scale view (method 31/138)."""
     model.eval()
     total = None
     for scale in TTA_SCALES:
         for flip in (False, True):
-            loader = DataLoader(MammoDataset(images, None, False, scale=scale, flip=flip),
+            loader = DataLoader(MammoDataset(images, None, False, size,
+                                             scale=scale, flip=flip),
                                 batch_size=BATCH_SIZE)
             out = []
             for xb in loader:
@@ -283,7 +296,7 @@ def predict(model, images):
     return total / (len(TTA_SCALES) * 2)
 
 
-def train_fold(x_tr, y_tr, seed):
+def train_fold(x_tr, y_tr, size, seed):
     torch.manual_seed(seed)
     np.random.seed(seed)
     model = build_model().to(DEVICE)
@@ -332,7 +345,8 @@ def train_fold(x_tr, y_tr, seed):
         return max(0, int(round(max_block * (1.0 - (epoch - WARMUP_EPOCHS) / span))))
 
     opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-    loader = DataLoader(MammoDataset(x_tr, y_tr, True, seed), batch_size=BATCH_SIZE, shuffle=True,
+    loader = DataLoader(MammoDataset(x_tr, y_tr, True, size, seed),
+                        batch_size=BATCH_SIZE, shuffle=True,
                         drop_last=len(x_tr) > BATCH_SIZE, num_workers=2, pin_memory=True)
     steps = max(1, len(loader)) * max(1, EPOCHS - WARMUP_EPOCHS)
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=LR, total_steps=steps,
@@ -483,29 +497,109 @@ def try_blend(oof, test_prob, y):
 
 
 
-def stage_1_zeroshot(x_train, y):
+def stage_1_zeroshot(x_train, y, size):
     """Score the checkpoint untouched. Cheap, and it decides whether stage 2 is worth it."""
     print("=" * 68)
     print("STAGE 1 -- zero-shot, no fine-tuning")
     print("=" * 68)
     model = build_model(keep_head=True).to(DEVICE).eval()
-    prob = predict(model, x_train)
-    pred = prob.argmax(1)
+    pred = predict(model, x_train, size).argmax(1)
     score = f1_score(y, pred, average="macro")
     print(f"zero-shot macro F1 on the 212 training images = {score:.4f}   (chance ~0.33)")
-    print("confusion (rows=true, cols=pred), order " + ", ".join(CLASSES))
-    for row in confusion_matrix(y, pred):
-        print("   ", row)
     counts = np.bincount(pred, minlength=3)
     print("prediction spread: " + "  ".join(f"{c}={n}" for c, n in zip(CLASSES, counts)))
     if counts.max() > 0.8 * len(y):
         print("  -> collapsed onto one class. That is what a checkpoint reading the")
-        print("     wrong imaging modality looks like.")
-    print(f"\nread this as: <0.40 the checkpoint does not transfer -- prefer resnet34;")
-    print(f"              0.40-0.55 weak transfer; >0.55 worth fine-tuning here.\n")
+        print("     wrong imaging modality looks like, and it says little: this one")
+        print("     scored 0.1922 here and still fine-tuned to 0.64.")
+    print()
     del model
     torch.cuda.empty_cache()
     return score
+
+
+def run_variant(variant, x_train, y, x_test, t0):
+    """One full cross-validated run at this variant's resolution."""
+    size = (variant["h"], variant["w"])
+    seed = variant["seed"]
+    tag = f"{variant['h']}x{variant['w']}_s{seed}"
+    print("=" * 68)
+    print(f"VARIANT {tag}   (native 224x224 uses the position embeddings as-is; "
+          f"anything larger interpolates them)")
+    print("=" * 68)
+
+    oof = np.zeros((len(y), 3), dtype=np.float32)
+    test_prob = np.zeros((len(x_test), 3), dtype=np.float32)
+    scores = []
+    for f, (tr, va) in enumerate(StratifiedKFold(N_FOLDS, shuffle=True,
+                                                 random_state=seed).split(y, y)):
+        model, snaps = train_fold(x_train[tr], y[tr], size, seed * 100 + f)
+        # EMA weights plus each snapshot, averaged: one training run, several points
+        # on its trajectory, and they disagree in useful ways.
+        va_prob = predict(model, x_train[va], size)
+        te_prob = predict(model, x_test, size)
+        if snaps:
+            ema_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+            for snap in snaps:
+                model.load_state_dict(snap)
+                va_prob += predict(model, x_train[va], size)
+                te_prob += predict(model, x_test, size)
+            model.load_state_dict(ema_state)
+            va_prob /= (1 + len(snaps))
+            te_prob /= (1 + len(snaps))
+        confidence_report(va_prob)
+        oof[va] = va_prob
+        test_prob += te_prob
+        s = f1_score(y[va], va_prob.argmax(1), average="macro")
+        scores.append(s)
+        print(f"  fold {f}: macroF1 {s:.4f}  ({time.time() - t0:.0f}s)", flush=True)
+        del model
+        torch.cuda.empty_cache()
+    test_prob /= N_FOLDS
+    print(f"  OOF macro F1 {f1_score(y, oof.argmax(1), average='macro'):.4f}   "
+          f"fold spread {min(scores):.3f}-{max(scores):.3f}\n")
+    np.save(f"/kaggle/working/oof_vit_{tag}.npy", oof)
+    np.save(f"/kaggle/working/test_vit_{tag}.npy", test_prob)
+    return oof, test_prob, tag
+
+
+def blend_variants(oofs, tests, tags, y):
+    """Weighted blend across variants, with the weights checked cross-fitted."""
+    solo = [f1_score(y, o.argmax(1), average="macro") for o in oofs]
+    for tag, sc in zip(tags, solo):
+        print(f"  {tag:<24} OOF {sc:.4f}")
+    best_i = int(np.argmax(solo))
+    if len(oofs) == 1:
+        return oofs[0], tests[0]
+
+    grid = [np.array(w) / 10 for w in np.ndindex(*(11,) * len(oofs)) if sum(w) == 10]
+
+    def search(subset, yy):
+        best, arg = -1.0, grid[0]
+        for w in grid:
+            sc = f1_score(yy, sum(wi * o for wi, o in zip(w, subset)).argmax(1),
+                          average="macro")
+            if sc > best:
+                best, arg = sc, w
+        return arg
+
+    # Pick the weights on four folds, score the fifth. Searching a grid against the
+    # same 212 rows it is then reported on is worth several points of self-flattery.
+    pred = np.empty(len(y), dtype=np.int64)
+    for tr, va in StratifiedKFold(N_FOLDS, shuffle=True, random_state=0).split(y, y):
+        w = search([o[tr] for o in oofs], y[tr])
+        pred[va] = sum(wi * o[va] for wi, o in zip(w, oofs)).argmax(1)
+    cf = f1_score(y, pred, average="macro")
+    print(f"\n  cross-fitted blend {cf:.4f}   vs best single {solo[best_i]:.4f}")
+
+    if cf <= solo[best_i]:
+        print(f"  -> blend does NOT hold up; shipping {tags[best_i]} alone")
+        return oofs[best_i], tests[best_i]
+    w = search(oofs, y)
+    print("  -> shipping the blend, weights " +
+          ", ".join(f"{t}={wi:.2f}" for t, wi in zip(tags, w)))
+    return (sum(wi * o for wi, o in zip(w, oofs)),
+            sum(wi * t for wi, t in zip(w, tests)))
 
 
 def main():
@@ -514,9 +608,9 @@ def main():
     test = pd.read_csv(f"{DATA_DIR}/test.csv")
     y = np.array([CLASSES.index(v) for v in train.label], dtype=np.int64)
 
-    print(f"device={DEVICE}  model={MODEL_ID}  input={MODEL_H}x{MODEL_W}  keep_head={KEEP_HEAD}")
-    print(f"folds={N_FOLDS}  seeds={SEEDS}  epochs={EPOCHS}  loss={LOSS}  "
-          f"tta_views={len(TTA_SCALES) * 2}")
+    print(f"device={DEVICE}  model={MODEL_ID}  keep_head={KEEP_HEAD}")
+    print(f"variants={[(v['h'], v['w'], v['seed']) for v in VARIANTS]}  folds={N_FOLDS}  "
+          f"epochs={EPOCHS}  loss={LOSS}  tta_views={len(TTA_SCALES) * 2}")
     print(f"snapshot_every={SNAPSHOT_EPOCHS}  warmup={WARMUP_EPOCHS}  "
           f"gradual_unfreeze={GRADUAL_UNFREEZE}  blend_sources={len(BLEND_WITH)}")
     print("preprocessing...", flush=True)
@@ -525,42 +619,19 @@ def main():
     print(f"  done in {time.time() - t0:.0f}s  {x_train.shape} {x_test.shape}\n", flush=True)
 
     if RUN_STAGE_1:
-        stage_1_zeroshot(x_train, y)
+        stage_1_zeroshot(x_train, y, (VARIANTS[0]["h"], VARIANTS[0]["w"]))
+
+    oofs, tests, tags = [], [], []
+    for variant in VARIANTS:
+        o, t, tag = run_variant(variant, x_train, y, x_test, t0)
+        oofs.append(o)
+        tests.append(t)
+        tags.append(tag)
 
     print("=" * 68)
-    print("STAGE 2 -- fine-tuning")
+    print("BLEND ACROSS VARIANTS")
     print("=" * 68)
-    oof = np.zeros((len(y), 3), dtype=np.float32)
-    test_prob = np.zeros((len(test), 3), dtype=np.float32)
-    n_runs = 0
-    for seed in SEEDS:
-        for f, (tr, va) in enumerate(StratifiedKFold(N_FOLDS, shuffle=True,
-                                                     random_state=seed).split(y, y)):
-            model, snaps = train_fold(x_train[tr], y[tr], seed * 100 + f)
-            # EMA weights plus each snapshot, averaged: one training run, several
-            # points on its trajectory, and they disagree in useful ways.
-            va_prob = predict(model, x_train[va])
-            te_prob = predict(model, x_test)
-            if snaps:
-                ema_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
-                for snap in snaps:
-                    model.load_state_dict(snap)
-                    va_prob += predict(model, x_train[va])
-                    te_prob += predict(model, x_test)
-                model.load_state_dict(ema_state)
-                va_prob /= (1 + len(snaps))
-                te_prob /= (1 + len(snaps))
-            confidence_report(va_prob)
-            oof[va] += va_prob
-            test_prob += te_prob
-            n_runs += 1
-            print(f"  seed {seed} fold {f}: macroF1 "
-                  f"{f1_score(y[va], va_prob.argmax(1), average='macro'):.4f}  "
-                  f"({time.time() - t0:.0f}s)", flush=True)
-            del model
-            torch.cuda.empty_cache()
-    oof /= len(SEEDS)
-    test_prob /= n_runs
+    oof, test_prob = blend_variants(oofs, tests, tags, y)
     np.save("/kaggle/working/oof_vit.npy", oof)
     np.save("/kaggle/working/test_prob_vit.npy", test_prob)
 
@@ -569,25 +640,28 @@ def main():
     # Cross-fitted: weights for each fold's rows are fitted only on the other folds,
     # so the gain reported is one that can actually carry over to the test set.
     pred_cf = np.empty(len(y), dtype=np.int64)
-    for tr, va in StratifiedKFold(N_FOLDS, shuffle=True, random_state=SEEDS[0]).split(y, y):
+    for tr, va in StratifiedKFold(N_FOLDS, shuffle=True, random_state=0).split(y, y):
         pred_cf[va] = (oof[va] * fit_weights(oof[tr], y[tr])).argmax(1)
     plain = f1_score(y, oof.argmax(1), average="macro")
     tuned = f1_score(y, pred_cf, average="macro")
 
     print("\n" + "=" * 68)
-    print(f"OOF macro F1  plain={plain:.4f}   tuned(cross-fitted)={tuned:.4f}")
-    print("  ^ THIS is the number to compare against other runs. Not the public LB,")
-    print("    which is scored on about 16 images and is mostly sampling noise.")
+    print(f"FINAL OOF  plain={plain:.4f}   class-prior tuned(cross-fitted)={tuned:.4f}")
+    print("  ^ THIS is the number to compare across runs. Not the public LB, which is")
+    print("    scored on ~16 images -- six teams sit on the identical score there.")
     w = fit_weights(oof, y) if tuned > plain else np.ones(3)
     print(f"class weights {np.round(w, 3)} for {CLASSES}")
+    final = (oof * w).argmax(1)
+    print("per-class F1: " + "  ".join(
+        f"{c}={f1_score(y, final, average=None, labels=[i])[0]:.3f}"
+        for i, c in enumerate(CLASSES)))
     print("confusion (rows=true, cols=pred), order " + ", ".join(CLASSES))
-    for row in confusion_matrix(y, (oof * w).argmax(1)):
+    for row in confusion_matrix(y, final):
         print("   ", row)
 
-    pred = (test_prob * w).argmax(1)
-    sub = pd.DataFrame({"image_id": test.image_id, "label": [CLASSES[i] for i in pred]})
+    sub = pd.DataFrame({"image_id": test.image_id,
+                        "label": [CLASSES[i] for i in (test_prob * w).argmax(1)]})
     sub.to_csv(OUT_CSV, index=False)
-
     assert len(sub) == len(test) and sub.image_id.is_unique
     assert set(sub.label) <= set(CLASSES)
     print(f"\nwrote {OUT_CSV} in {time.time() - t0:.0f}s")
