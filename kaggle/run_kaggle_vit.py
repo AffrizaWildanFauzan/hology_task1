@@ -24,6 +24,7 @@ Runtime: ~3 min for stage 1, ~25-40 min for stage 2 on a P100/T4.
 from __future__ import annotations
 
 import os
+import re
 import time
 
 import cv2
@@ -62,6 +63,47 @@ DROPOUT = 0.1
 LABEL_SMOOTHING = 0.05
 EMA_DECAY = 0.99
 RUN_STAGE_1 = True         # zero-shot check before training
+
+# ---------------------------------------------------------------------------
+# Optional methods
+#
+# The defaults below reproduce the configuration that scored OOF 0.6401 and 0.6172
+# on two runs. That is deliberate. Every previous attempt to switch several of these
+# on at once made things worse -- mixup and a balanced sampler together cost this
+# model 0.052 and collapsed a resnet34 to 0.1272 -- so each is a separate flag.
+# Change ONE, rerun, and compare the OOF line. The fold-to-fold spread here is about
+# 0.15, so a change worth under 0.02 cannot be told apart from noise on one run.
+# ---------------------------------------------------------------------------
+
+# Method 31/138 -- test-time augmentation. Horizontal flip is always applied, so this
+# is 2 views by default, (1.0, 0.9) gives 4 and (1.0, 0.95, 0.9, 0.85) gives 8. Costs
+# inference time only, never training, and averaging rarely hurts. Try this first.
+TTA_SCALES = (1.0,)
+
+# Method 29 -- snapshot ensemble. Keep a checkpoint every N epochs over the last third
+# of training and average its predictions with the EMA weights. Several points on one
+# trajectory that disagree usefully, at no extra training cost. 0 disables it.
+SNAPSHOT_EPOCHS = 0
+
+# Method 3/131 -- gradual unfreezing. Less compelling here than elsewhere: this
+# checkpoint's head is reused rather than randomly initialised, so there is no
+# gradient shock to protect the backbone from. Kept available for comparison.
+WARMUP_EPOCHS = 0          # epochs training the head alone before anything unfreezes
+GRADUAL_UNFREEZE = False   # after the warmup, release one block at a time
+
+# Method 36 (default) or 40. Logit adjustment adds tau * log(prior) to the logits
+# instead of re-weighting the loss, which targets macro F1 without changing a class's
+# effective sample size -- so it does not stack with other imbalance corrections the
+# way the sampler did when it collapsed an earlier run.
+LOSS = "weighted_ce"       # "weighted_ce" or "logit_adjust"
+LOGIT_ADJUST_TAU = 1.0
+
+# Method 51/73 -- blend this run with probabilities saved by another one, sweeping a
+# mixing weight and a temperature. Blending two models that fail differently was worth
+# +0.09 out-of-fold here, more than any single-model change tried. The winner is
+# re-checked cross-fitted and only shipped if it survives that.
+BLEND_WITH = []            # e.g. [("/kaggle/input/prev/oof_r34.npy",
+                           #        "/kaggle/input/prev/test_r34.npy")]
 
 CLASSES = ["Benign", "Malignant", "Normal"]
 MEAN, STD = 0.449, 0.226
@@ -126,8 +168,9 @@ def rand_affine(img, rng):
 class MammoDataset(Dataset):
     """Geometry-heavy, photometry-light: lesion appearance is the signal."""
 
-    def __init__(self, images, labels, train, seed=0):
+    def __init__(self, images, labels, train, seed=0, scale=1.0, flip=False):
         self.images, self.labels, self.train = images, labels, train
+        self.scale, self.flip = scale, flip      # fixed transforms, for TTA
         self.rng = np.random.default_rng(seed)
 
     def __len__(self):
@@ -153,6 +196,13 @@ class MammoDataset(Dataset):
                     img[y0:y0 + ch, x0:x0 + cw] = 0.0
         else:
             img = img.astype(np.float32) / 255.0
+            if self.flip:
+                img = img[:, ::-1].copy()
+            if self.scale != 1.0:
+                h, w = img.shape                       # centre zoom, size fixed after
+                ch, cw = int(h * self.scale), int(w * self.scale)
+                y0, x0 = (h - ch) // 2, (w - cw) // 2
+                img = img[y0:y0 + ch, x0:x0 + cw]
         if img.shape != (MODEL_H, MODEL_W):
             img = cv2.resize(img, (MODEL_W, MODEL_H), interpolation=cv2.INTER_AREA)
         x = torch.from_numpy(np.ascontiguousarray((img - MEAN) / STD))[None].repeat(3, 1, 1)
@@ -216,14 +266,21 @@ class EMA:
 
 @torch.no_grad()
 def predict(model, images):
+    """Average over every flip x scale view (method 31/138)."""
     model.eval()
-    out = []
-    for xb in DataLoader(MammoDataset(images, None, False), batch_size=BATCH_SIZE):
-        xb = xb.to(DEVICE)
-        with torch.amp.autocast("cuda", enabled=DEVICE == "cuda"):
-            p = (model(xb).softmax(1) + model(torch.flip(xb, dims=[3])).softmax(1)) / 2
-        out.append(p.float().cpu().numpy())
-    return np.concatenate(out)
+    total = None
+    for scale in TTA_SCALES:
+        for flip in (False, True):
+            loader = DataLoader(MammoDataset(images, None, False, scale=scale, flip=flip),
+                                batch_size=BATCH_SIZE)
+            out = []
+            for xb in loader:
+                xb = xb.to(DEVICE)
+                with torch.amp.autocast("cuda", enabled=DEVICE == "cuda"):
+                    out.append(model(xb).softmax(1).float().cpu().numpy())
+            p = np.concatenate(out)
+            total = p if total is None else total + p
+    return total / (len(TTA_SCALES) * 2)
 
 
 def train_fold(x_tr, y_tr, seed):
@@ -232,19 +289,64 @@ def train_fold(x_tr, y_tr, seed):
     model = build_model().to(DEVICE)
 
     # macro F1 weights all three classes equally while the data does not
-    # (52 Benign vs 80/80), so the loss is inverse-frequency weighted to match.
+    # (52 Benign vs 80/80), so the loss has to make up the difference.
     counts = np.bincount(y_tr, minlength=3).astype(np.float32)
-    crit = nn.CrossEntropyLoss(weight=torch.tensor(counts.sum() / (3 * counts), device=DEVICE),
-                               label_smoothing=LABEL_SMOOTHING)
+    if LOSS == "logit_adjust":
+        log_prior = torch.tensor(np.log(counts / counts.sum()), device=DEVICE,
+                                 dtype=torch.float32)
+        base = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
+
+        def crit(logits, target):
+            return base(logits + LOGIT_ADJUST_TAU * log_prior, target)
+    else:
+        crit = nn.CrossEntropyLoss(
+            weight=torch.tensor(counts.sum() / (3 * counts), device=DEVICE),
+            label_smoothing=LABEL_SMOOTHING)
+
+    # Block index per parameter, for gradual unfreezing. ViT blocks are
+    # `encoder.layer.N`; the embeddings count as block 0.
+    depth_of, max_block = {}, 1
+    for n, _ in model.named_parameters():
+        m = re.search(r"layer\.(\d+)\.", n)
+        d = (int(m.group(1)) + 1) if m else (0 if "embed" in n else None)
+        depth_of[n] = d
+        if d is not None:
+            max_block = max(max_block, d)
+
+    def set_trainable(unfrozen_from):
+        """Unfreeze the head plus every block at or above `unfrozen_from`; None = head only."""
+        for n, p in model.named_parameters():
+            if "classifier" in n:
+                p.requires_grad_(True)
+                continue
+            d = depth_of[n]
+            p.requires_grad_(unfrozen_from is not None
+                             and (max_block if d is None else d) >= unfrozen_from)
+
+    def unfreeze_plan(epoch):
+        if epoch < WARMUP_EPOCHS:
+            return None
+        if not GRADUAL_UNFREEZE:
+            return 0
+        span = max(1, EPOCHS - WARMUP_EPOCHS)
+        return max(0, int(round(max_block * (1.0 - (epoch - WARMUP_EPOCHS) / span))))
+
     opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     loader = DataLoader(MammoDataset(x_tr, y_tr, True, seed), batch_size=BATCH_SIZE, shuffle=True,
                         drop_last=len(x_tr) > BATCH_SIZE, num_workers=2, pin_memory=True)
-    sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=LR, total_steps=len(loader) * EPOCHS,
+    steps = max(1, len(loader)) * max(1, EPOCHS - WARMUP_EPOCHS)
+    sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=LR, total_steps=steps,
                                                 pct_start=0.25)
     ema = EMA(model, EMA_DECAY)
     scaler = torch.amp.GradScaler("cuda", enabled=DEVICE == "cuda")
-    n_steps = n_skipped = 0
-    for _ in range(EPOCHS):
+    n_ok = n_skip = 0
+
+    snapshots = []                       # method 29
+    snapshot_from = int(EPOCHS * 2 / 3)
+
+    for epoch in range(EPOCHS):
+        warming = epoch < WARMUP_EPOCHS
+        set_trainable(unfreeze_plan(epoch))
         model.train()
         for xb, yb in loader:
             xb, yb = xb.to(DEVICE, non_blocking=True), yb.to(DEVICE, non_blocking=True)
@@ -253,24 +355,45 @@ def train_fold(x_tr, y_tr, seed):
                 loss = crit(model(xb), yb)
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
-            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], 1.0)
             scale_before = scaler.get_scale()
             scaler.step(opt)
             scaler.update()
-            # A dropped scale means GradScaler skipped this step (fp16 overflow);
-            # advancing the schedule or the EMA on a step that never happened is how
-            # a run quietly ends up undertrained.
+            # A dropped scale means GradScaler skipped this step (fp16 overflow).
+            # Advancing the schedule or the EMA on a step that never happened is how a
+            # run quietly ends up undertrained.
             if scaler.get_scale() >= scale_before:
-                sched.step()
+                if not warming and sched.last_epoch < steps - 1:
+                    sched.step()
                 ema.update(model)
-                n_steps += 1
+                n_ok += 1
             else:
-                n_skipped += 1
-    if n_skipped > 0.1 * max(n_steps + n_skipped, 1):
-        print(f"    WARNING: fp16 overflow skipped {n_skipped}/{n_steps + n_skipped} "
-              f"optimizer steps -- lower LR or the fold will be undertrained", flush=True)
+                n_skip += 1
+
+        if (SNAPSHOT_EPOCHS and epoch >= snapshot_from
+                and (epoch - snapshot_from) % SNAPSHOT_EPOCHS == 0):
+            snapshots.append({k: v.detach().clone() for k, v in model.state_dict().items()})
+
+    set_trainable(0)
+    if n_skip > 0.1 * max(n_ok + n_skip, 1):
+        print(f"    WARNING: fp16 overflow skipped {n_skip}/{n_ok + n_skip} optimizer "
+              f"steps -- lower LR", flush=True)
     ema.copy_to(model)
-    return model
+    return model, snapshots
+
+
+def confidence_report(prob):
+    """Flag a fold that produced near-uniform probabilities.
+
+    A three-class softmax floors at 0.333. Two earlier runs posted a plausible-looking
+    macro F1 while sitting at a median max-prob under 0.42 -- they had not learned
+    anything, and only this said so. A healthy fold sits near 0.7.
+    """
+    med = float(np.median(prob.max(1)))
+    flag = "   <-- NEAR-UNIFORM, this fold did not train" if med < 0.45 else ""
+    print(f"    confidence: median max-prob {med:.3f}, "
+          f"{(prob.max(1) > 0.5).mean():.0%} above 0.5{flag}", flush=True)
+
 
 # ---------------------------------------------------------------------------
 # Class-prior tuning
@@ -348,6 +471,10 @@ def main():
     y = np.array([CLASSES.index(v) for v in train.label], dtype=np.int64)
 
     print(f"device={DEVICE}  model={MODEL_ID}  input={MODEL_H}x{MODEL_W}  keep_head={KEEP_HEAD}")
+    print(f"folds={N_FOLDS}  seeds={SEEDS}  epochs={EPOCHS}  loss={LOSS}  "
+          f"tta_views={len(TTA_SCALES) * 2}")
+    print(f"snapshot_every={SNAPSHOT_EPOCHS}  warmup={WARMUP_EPOCHS}  "
+          f"gradual_unfreeze={GRADUAL_UNFREEZE}  blend_sources={len(BLEND_WITH)}")
     print("preprocessing...", flush=True)
     x_train = build_cache(train.image_id, f"{DATA_DIR}/train_images")
     x_test = build_cache(test.image_id, f"{DATA_DIR}/test_images")
@@ -378,6 +505,10 @@ def main():
             torch.cuda.empty_cache()
     oof /= len(SEEDS)
     test_prob /= n_runs
+    np.save("/kaggle/working/oof_vit.npy", oof)
+    np.save("/kaggle/working/test_prob_vit.npy", test_prob)
+
+    oof, test_prob = try_blend(oof, test_prob, y)
 
     # Cross-fitted: weights for each fold's rows are fitted only on the other folds,
     # so the gain reported is one that can actually carry over to the test set.
@@ -400,8 +531,6 @@ def main():
     pred = (test_prob * w).argmax(1)
     sub = pd.DataFrame({"image_id": test.image_id, "label": [CLASSES[i] for i in pred]})
     sub.to_csv(OUT_CSV, index=False)
-    np.save("/kaggle/working/oof_vit.npy", oof)
-    np.save("/kaggle/working/test_prob_vit.npy", test_prob)
 
     assert len(sub) == len(test) and sub.image_id.is_unique
     assert set(sub.label) <= set(CLASSES)
