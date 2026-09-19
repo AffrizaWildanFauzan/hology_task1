@@ -28,10 +28,14 @@ class MammoDataset(Dataset):
     keep intensity distortions mild enough not to erase it.
     """
 
-    def __init__(self, images: np.ndarray, labels: np.ndarray | None, train: bool, seed: int = 0):
+    def __init__(self, images: np.ndarray, labels: np.ndarray | None, train: bool, seed: int = 0,
+                 out_size: tuple[int, int] | None = None):
         self.images = images
         self.labels = labels
         self.train = train
+        # Backbones with a fixed input resolution (ViT checkpoints, say) need a size
+        # the cache was not built at; resizing here keeps one cache serving all of them.
+        self.out_size = out_size
         self.rng = np.random.default_rng(seed)
 
     def __len__(self) -> int:
@@ -55,8 +59,13 @@ class MammoDataset(Dataset):
         return img
 
     def __getitem__(self, i: int):
+        import cv2
+
         img = self.images[i]
         img = self._augment(img) if self.train else img.astype(np.float32) / 255.0
+        if self.out_size is not None and img.shape != self.out_size:
+            img = cv2.resize(img, (self.out_size[1], self.out_size[0]),
+                             interpolation=cv2.INTER_AREA)
         img = (img - IMAGENET_MEAN) / IMAGENET_STD
         x = torch.from_numpy(np.ascontiguousarray(img))[None].repeat(3, 1, 1)
         if self.labels is None:

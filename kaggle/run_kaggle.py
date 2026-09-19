@@ -39,8 +39,18 @@ WEIGHTS_FILE = None           # e.g. "/kaggle/input/resnet34-imagenet/resnet34-4
 MIRROR_URL = ("https://github.com/huggingface/pytorch-image-models/releases/download/"
               "v0.1-weights/resnet34-43635321.pth")
 
-IMG_H, IMG_W = 512, 384
+IMG_H, IMG_W = 512, 384   # cache resolution
+MODEL_H, MODEL_W = IMG_H, IMG_W   # what the model sees; ViT-base is native 224x224
+                                  # but interpolate_pos_encoding lets it take more
+# "resnet34" (timm/torchvision) or "hf:<repo_id>" for a Hugging Face classifier,
+# e.g. "hf:hugging-science/breast-cancer-detector-2". The Hugging Face path needs
+# the notebook's internet switch ON, or the repo attached as a Kaggle Model input
+# with HF_MODEL_DIR pointing at it. Read HANDOFF.md section 6.7 first -- that
+# checkpoint was trained on breast ultrasound, not mammography.
 MODEL_NAME = "resnet34"
+HF_MODEL_DIR = None       # local path to the HF repo, for an offline run
+HF_KEEP_HEAD = True       # keep the checkpoint's 3-class head as a warm start;
+                          # only sound when its label order is benign/malignant/normal
 N_FOLDS = 5
 SEEDS = [0, 1]                # repeated CV; more seeds = steadier estimate
 EPOCHS = 25
@@ -135,12 +145,44 @@ class MammoDataset(Dataset):
                     img[y0:y0 + ch, x0:x0 + cw] = 0.0
         else:
             img = img.astype(np.float32) / 255.0
+        if img.shape != (MODEL_H, MODEL_W):
+            img = cv2.resize(img, (MODEL_W, MODEL_H), interpolation=cv2.INTER_AREA)
         x = torch.from_numpy(np.ascontiguousarray((img - MEAN) / STD))[None].repeat(3, 1, 1)
         return x if self.labels is None else (x, int(self.labels[i]))
 
 # ----------------------------------------------------------------------------
 # Model
 # ----------------------------------------------------------------------------
+
+
+class HFClassifier(nn.Module):
+    """Wraps a Hugging Face image classifier so it behaves like a timm model.
+
+    `interpolate_pos_encoding` resamples a ViT's 224x224 position embeddings, so we
+    can feed the larger crops that sub-millimetre mammographic lesions need instead
+    of squashing everything to 224.
+    """
+
+    def __init__(self, repo_id, num_classes=3, dropout=DROPOUT, keep_head=False):
+        super().__init__()
+        from transformers import AutoModelForImageClassification
+
+        kwargs = {} if keep_head else dict(num_labels=num_classes, ignore_mismatched_sizes=True)
+        self.model = AutoModelForImageClassification.from_pretrained(repo_id, **kwargs)
+        if keep_head:
+            if self.model.classifier.out_features != num_classes:
+                raise ValueError(f"{repo_id} head has {self.model.classifier.out_features} "
+                                 f"classes, expected {num_classes}")
+        else:
+            in_f = self.model.classifier.in_features
+            self.model.classifier = nn.Sequential(nn.Dropout(dropout),
+                                                  nn.Linear(in_f, num_classes))
+        self.interp = "vit" in self.model.config.model_type
+
+    def forward(self, x):
+        if self.interp:
+            return self.model(pixel_values=x, interpolate_pos_encoding=True).logits
+        return self.model(pixel_values=x).logits
 
 
 def _bare_model():
@@ -175,8 +217,13 @@ _WEIGHT_SOURCE = None
 
 
 def build_model():
-    """ImageNet-pretrained backbone, with fallbacks so an offline run still works."""
+    """Pretrained backbone, with fallbacks so an offline run still works."""
     global _WEIGHT_SOURCE
+
+    if MODEL_NAME.startswith("hf:"):
+        src = HF_MODEL_DIR or MODEL_NAME[3:]
+        _WEIGHT_SOURCE = _WEIGHT_SOURCE or f"Hugging Face: {src}"
+        return HFClassifier(src, 3, DROPOUT, HF_KEEP_HEAD)
 
     try:                                        # 1. normal download (internet ON)
         import timm

@@ -1,8 +1,20 @@
 """Backbone construction.
 
-Only ImageNet-pretrained classifiers from timm/torchvision are used, which the
-competition rules allow explicitly ("pretrained model ... yang tersedia secara
-publik"). No detection models and nothing from Ultralytics.
+Only publicly available pretrained classifiers are used, which the competition
+rules allow explicitly ("pretrained model ... yang tersedia secara publik"). No
+detection models and nothing from Ultralytics.
+
+Two families are supported:
+
+  * timm / torchvision ImageNet backbones, named directly ("resnet34").
+  * Hugging Face image classifiers, named with an "hf:" prefix
+    ("hf:hugging-science/breast-cancer-detector-2").
+
+The Hugging Face path exists for hugging-science/breast-cancer-detector-2, whose
+label order (benign, malignant, normal) matches CLASSES exactly, so its trained
+classifier head can be kept as a warm start instead of thrown away. Read the
+caveat in HANDOFF.md section 6.7 before using it: that checkpoint was trained on
+breast *ultrasound*, and its own model card lists mammography as out of scope.
 """
 from __future__ import annotations
 
@@ -13,6 +25,48 @@ import torch
 import torch.nn as nn
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+
+class HFClassifier(nn.Module):
+    """Wraps a Hugging Face image classifier so it behaves like a timm model.
+
+    Two details matter for this competition:
+
+    * The transformers API returns an output object; training code here expects a
+      plain logits tensor.
+    * ViT checkpoints carry position embeddings for one fixed resolution (224 for
+      vit-base-patch16-224). `interpolate_pos_encoding` resamples them, which lets
+      us feed the larger crops that small mammographic lesions need. Without it the
+      input would have to be squashed to 224x224 and microcalcifications would be
+      gone.
+    """
+
+    def __init__(self, repo_id: str, num_classes: int = 3, dropout: float = 0.3,
+                 keep_head: bool = False):
+        super().__init__()
+        from transformers import AutoModelForImageClassification
+
+        kwargs = {}
+        if not keep_head:
+            # Re-initialise the classifier unless the caller wants the checkpoint's
+            # own head as a warm start (only sound when the label order matches).
+            kwargs = dict(num_labels=num_classes, ignore_mismatched_sizes=True)
+        self.model = AutoModelForImageClassification.from_pretrained(repo_id, **kwargs)
+
+        in_f = self.model.classifier.in_features
+        if keep_head and self.model.classifier.out_features != num_classes:
+            raise ValueError(
+                f"{repo_id} has {self.model.classifier.out_features} output classes, "
+                f"cannot keep its head for {num_classes}")
+        if not keep_head:
+            self.model.classifier = nn.Sequential(nn.Dropout(dropout),
+                                                  nn.Linear(in_f, num_classes))
+        self.supports_interpolation = "vit" in self.model.config.model_type
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.supports_interpolation:
+            return self.model(pixel_values=x, interpolate_pos_encoding=True).logits
+        return self.model(pixel_values=x).logits
 
 
 def _replace_head(model: nn.Module, num_classes: int, dropout: float) -> nn.Module:
@@ -53,7 +107,10 @@ def _from_mirror(name: str, num_classes: int, dropout: float) -> nn.Module:
 
 
 def build_model(name: str = "resnet34", num_classes: int = 3, pretrained: bool = True,
-                dropout: float = 0.3) -> nn.Module:
+                dropout: float = 0.3, keep_head: bool = False) -> nn.Module:
+    if name.startswith("hf:"):
+        return HFClassifier(name[3:], num_classes, dropout, keep_head)
+
     if not pretrained:
         try:
             import timm

@@ -35,9 +35,11 @@ def set_seed(seed: int) -> None:
 
 
 @torch.no_grad()
-def predict(model: nn.Module, images: np.ndarray, device: str, batch_size: int, tta: bool) -> np.ndarray:
+def predict(model: nn.Module, images: np.ndarray, device: str, batch_size: int, tta: bool,
+            out_size=None) -> np.ndarray:
     model.eval()
-    loader = DataLoader(MammoDataset(images, None, train=False), batch_size=batch_size)
+    loader = DataLoader(MammoDataset(images, None, train=False, out_size=out_size),
+                        batch_size=batch_size)
     out = []
     for xb in loader:
         xb = xb.to(device)
@@ -51,7 +53,7 @@ def predict(model: nn.Module, images: np.ndarray, device: str, batch_size: int, 
 def train_fold(x_tr, y_tr, x_va, y_va, args, device, seed):
     set_seed(seed)
     model = build_model(args.model, len(CLASSES), pretrained=not args.no_pretrained,
-                        dropout=args.dropout).to(device)
+                        dropout=args.dropout, keep_head=args.keep_head).to(device)
 
     # Benign is the minority class (52 vs 80/80) and macro F1 weights all three
     # equally, so the loss is inverse-frequency weighted to match the metric.
@@ -60,7 +62,8 @@ def train_fold(x_tr, y_tr, x_va, y_va, args, device, seed):
     criterion = nn.CrossEntropyLoss(weight=weights, label_smoothing=args.label_smoothing)
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    train_loader = DataLoader(MammoDataset(x_tr, y_tr, train=True, seed=seed),
+    train_loader = DataLoader(MammoDataset(x_tr, y_tr, train=True, seed=seed,
+                                           out_size=args.img_size),
                               batch_size=args.batch_size, shuffle=True, drop_last=len(x_tr) > args.batch_size,
                               num_workers=args.workers, pin_memory=device == "cuda")
     steps = max(1, len(train_loader)) * args.epochs
@@ -91,7 +94,7 @@ def train_fold(x_tr, y_tr, x_va, y_va, args, device, seed):
     # The EMA weights are what we evaluate and ship; the raw last-step weights are
     # noticeably noisier at this sample size.
     ema.copy_to(model)
-    va_prob = predict(model, x_va, device, args.batch_size, args.tta)
+    va_prob = predict(model, x_va, device, args.batch_size, args.tta, args.img_size)
     return model, va_prob
 
 
@@ -99,7 +102,13 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--cache", default=os.path.join(ROOT, "artifacts", "cache.npz"))
     ap.add_argument("--out-dir", default=os.path.join(ROOT, "artifacts", "run"))
-    ap.add_argument("--model", default="resnet34")
+    ap.add_argument("--model", default="resnet34",
+                    help='timm/torchvision name, or "hf:<repo_id>" for a Hugging Face classifier')
+    ap.add_argument("--img-size", nargs=2, type=int, default=None, metavar=("H", "W"),
+                    help="resize the cached crops to this before the model (default: cache size)")
+    ap.add_argument("--keep-head", action="store_true",
+                    help="keep the checkpoint's own classifier as a warm start; only valid "
+                         "when its label order matches CLASSES")
     ap.add_argument("--folds", type=int, default=5)
     ap.add_argument("--seeds", type=int, nargs="+", default=[0],
                     help="repeat the whole CV with these seeds and average")
@@ -115,6 +124,8 @@ def main() -> None:
     ap.add_argument("--no-pretrained", action="store_true")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
+    if args.img_size is not None:
+        args.img_size = tuple(args.img_size)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     os.makedirs(args.out_dir, exist_ok=True)
@@ -132,7 +143,7 @@ def main() -> None:
             tr, va = np.where(folds != f)[0], np.where(folds == f)[0]
             model, va_prob = train_fold(x_train[tr], y[tr], x_train[va], y[va], args, device, seed * 100 + f)
             oof[va] += va_prob
-            test_prob += predict(model, x_test, device, args.batch_size, args.tta)
+            test_prob += predict(model, x_test, device, args.batch_size, args.tta, args.img_size)
             n_runs += 1
             score = f1_score(y[va], va_prob.argmax(1), average="macro")
             print(f"  seed {seed} fold {f}: macroF1 {score:.4f}  ({time.time() - t0:.0f}s)", flush=True)

@@ -371,6 +371,82 @@ Rata-rata probabilitas dari seluruh model fold × seluruh seed, masing-masing de
 **flip-TTA** (identitas + cermin horizontal). Lalu kalikan bobot class-prior, lalu
 argmax.
 
+### 6.7 Backbone Hugging Face: `hugging-science/breast-cancer-detector-2`
+
+Tim meminta model ini dipakai sebagai satu-satunya model. Sudah diintegrasikan
+(`src/model.py::HFClassifier`, dipanggil dengan `--model hf:<repo_id>`). Berikut
+fakta lengkapnya supaya keputusan pakai/tidak pakai diambil dengan mata terbuka.
+
+**Spesifikasi (diverifikasi dari model card dan `config.json`):**
+
+| Properti | Nilai |
+|---|---|
+| Arsitektur | `ViTForImageClassification`, ViT-base-patch16-224 |
+| Parameter | 85.8 juta |
+| Resolusi asli | 224×224 |
+| Kelas | 3 — `benign`=0, `malignant`=1, `normal`=2 |
+| Lisensi | Apache-2.0 |
+| Rantai base model | `google/vit-base-patch16-224-in21k` → `Parveshiiii/breast-cancer-detector` → checkpoint ini |
+| Data latih | `gymprathap/Breast-Cancer-Ultrasound-Images-Dataset` (BUSI), ~1.578 citra |
+| Hasil yang diklaim | akurasi validasi 94.46% setelah 12 epoch |
+
+**Urutan label cocok persis dengan `CLASSES` kami** (`['Benign','Malignant','Normal']`
+→ benign, malignant, normal). Sudah diverifikasi lewat kode, bukan asumsi. Karena itu
+head klasifikasi bawaannya bisa dipertahankan sebagai *warm start* lewat `--keep-head`,
+tidak perlu dibuang dan dilatih dari nol.
+
+**Kepatuhan aturan: AMAN.** Aturan panitia membolehkan *"pretrained model ... yang
+tersedia secara publik"*, dan checkpoint ini publik serta berlisensi Apache-2.0. Data
+latihnya (BUSI, ultrasonografi) sama sekali tidak beririsan dengan mammogram lomba ini,
+jadi **tidak ada risiko kebocoran test set**. Ini kategori risiko yang berbeda dan jauh
+lebih rendah daripada artefak di §3.
+
+**Masalah teknisnya: modalitas citranya salah.**
+
+Model card-nya sendiri mencantumkan, di bawah *Out-of-Scope*:
+
+> - Use with **mammography**, MRI, CT, or any non-ultrasound modality.
+> - Images with text overlays, annotations, calipers, or other artifacts.
+
+Jadi pembuatnya secara eksplisit menyatakan model ini tidak untuk mammogram. Alasannya
+fisis, bukan sekadar kehati-hatian administratif:
+
+* **Ultrasonografi** adalah citra akustik — derau speckle, lesi hipoekoik, bayangan
+  akustik posterior, medan pandang sempit (beberapa sentimeter), resolusi ~500×500.
+* **Mammografi** adalah proyeksi sinar-X — atenuasi jaringan, mikrokalsifikasi
+  sub-milimeter, margin massa spiculated, seluruh payudara dalam satu frame 3540×4740.
+
+Ciri yang dipelajari pada satu modalitas tidak berlaku pada yang lain. Lebih jauh,
+fine-tuning 12 epoch pada 1.500 citra ultrasonografi **menjauhkan** bobotnya dari fitur
+umum ImageNet-21k. Jadi ada kemungkinan nyata checkpoint ini bekerja **lebih buruk**
+daripada backbone ImageNet biasa untuk tugas ini — bukan karena modelnya jelek, tapi
+karena spesialisasinya ke arah yang salah.
+
+**Angka 94.46% di model card tidak berlaku di sini.** Itu akurasi pada ultrasonografi
+BUSI, bukan macro F1 pada mammogram. Jangan dipakai sebagai ekspektasi.
+
+**Cara menyelesaikan perdebatan ini: ukur, jangan berargumen.**
+
+```bash
+# zero-shot: pakai prediksi bawaannya langsung, tanpa dilatih ulang
+python src/zeroshot_hf.py --model hugging-science/breast-cancer-detector-2
+
+# fine-tune sebagai backbone, lalu bandingkan OOF-nya dengan baseline
+python src/train.py --model hf:hugging-science/breast-cancer-detector-2 \
+    --keep-head --img-size 384 288 --folds 5 --seeds 0 --epochs 15 \
+    --out-dir artifacts/vit
+python src/tune_and_submit.py --run artifacts/vit --out submission_vit.csv
+```
+
+Bandingkan OOF-nya dengan baseline resnet34 di §8.4. Kalau lebih tinggi, pakai. Kalau
+lebih rendah, jangan — apa pun yang tertulis di model card.
+
+**Catatan resolusi.** ViT-base membawa position embedding untuk 224×224. `HFClassifier`
+menyalakan `interpolate_pos_encoding=True`, sehingga input lebih besar (384×288,
+512×384) tetap bisa dipakai. Ini penting: memampatkan mammogram ke 224×224 hampir pasti
+menghapus mikrokalsifikasi (§4). Tapi interpolasi position embedding menjauhkan model
+dari kondisi pralatihnya, jadi 224 vs 384 vs 512 perlu diukur, bukan diasumsikan.
+
 ---
 
 ## 7. Cara menjalankan
