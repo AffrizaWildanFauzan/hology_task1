@@ -400,7 +400,50 @@ python src/tune_and_submit.py --run artifacts/r34 artifacts/eb0 --out submission
 
 ## 8. Hasil
 
-<!-- RESULTS -->
+### 8.1 Status
+
+**Skor OOF final belum tersedia saat dokumen ini ditulis.** Run resnet34 5-fold x
+25 epoch sedang berjalan di CPU (~2,8 jam). Bagian ini akan diperbarui dengan angka
+nyata begitu selesai. Yang sudah terverifikasi ada di bawah.
+
+Reviewer: kalau Anda membaca ini dan §8.4 masih kosong, **jangan menilai kualitas
+model** -- belum ada angkanya. Tetap kerjakan §10 bagian A, B, C, E (kebenaran kode,
+kepatuhan aturan, format, reproduktibilitas); bagian D butuh angka.
+
+### 8.2 Yang sudah terverifikasi
+
+| Komponen | Status | Bukti |
+|---|---|---|
+| Preprocessing 266 citra | LULUS | 35 detik, cache 34 MB, 0 kegagalan crop |
+| Verifikasi visual crop | LULUS | contact sheet 6 citra/kelas: payudara terisolasi, orientasi seragam, anotasi hilang |
+| Bobot ImageNet termuat | LULUS | resnet34 216 tensor, efficientnet_b0 358 tensor; loss turun 0.78 -> 0.37 dalam 15 epoch (inisialisasi acak tidak berperilaku begini) |
+| Rantai train -> tune -> submit | LULUS | smoke run 2-fold x 2-epoch menghasilkan CSV yang lolos validator |
+| Format submission | LULUS | `src/validate_submission.py` |
+
+### 8.3 Batasan lingkungan tempat angka ini dihasilkan
+
+Angka lokal dihasilkan di mesin **tanpa GPU** (4 vCPU), dengan **satu seed**, dan
+proxy memblokir `download.pytorch.org` serta `huggingface.co` sehingga bobot ImageNet
+diambil dari mirror GitHub (`src/fetch_weights.py`).
+
+**Perlakukan angka lokal sebagai validasi bahwa pipeline-nya benar, bukan sebagai
+estimasi kualitas model akhir.** Konfigurasi Kaggle (`kaggle/run_kaggle.py`) memakai
+2 seed dan bisa di-ensemble dengan backbone kedua; hasilnya akan berbeda -- dan
+seharusnya lebih baik serta lebih stabil.
+
+### 8.4 Skor OOF
+
+<!-- Diisi setelah run selesai. Format yang akan diisi:
+     - OOF macro F1 plain argmax
+     - OOF macro F1 tuned (cross-fitted)  <- INI angka yang dikutip
+     - 95% CI bootstrap
+     - simulasi LB publik (16 citra)
+     - F1 per kelas + matriks konfusi
+     - distribusi prediksi pada test set
+-->
+
+*(belum tersedia -- lihat §8.1)*
+
 
 ---
 
@@ -435,7 +478,7 @@ bukti (nama file + nomor baris, atau angka).
 1. Apakah ada informasi dari fold validasi yang bocor ke pelatihan fold tersebut?
    Periksa `src/train.py` — khususnya bahwa bobot kelas pada loss dihitung dari `y_tr`
    saja, bukan dari seluruh `y`.
-2. Apakah tuning class-prior di `src/tune_and_submit.py::cross_fitted_gain` benar-benar
+2. Apakah tuning class-prior di `src/tune_and_submit.py::cross_fitted_predictions` benar-benar
    cross-fitted? Verifikasi bahwa `fit_weights` hanya menerima baris `~va`.
 3. Bobot final yang dikirim (`fit_weights(oof, y)`) dipasang pada seluruh OOF. Apakah
    ini masalah, mengingat keputusan *apakah akan menggunakan tuning sama sekali* sudah
