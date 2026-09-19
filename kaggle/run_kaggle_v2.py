@@ -83,12 +83,26 @@ N_FOLDS = 5
 SEEDS = [0, 1]               # repeated CV. The fold spread in the ViT run was 0.25,
                              # so averaging seeds is the highest-value knob here.
 EPOCHS = 16
-WARMUP_EPOCHS = 3            # head-only epochs before the backbone is unfrozen.
-                             # This checkpoint's 2-class head cannot be reused, so
-                             # ours starts random; letting its large early gradients
-                             # straight into a 197M-parameter backbone is the most
-                             # likely reason the first attempt never learned. The ViT
-                             # never hit this because its 3-class head was reusable.
+WARMUP_EPOCHS = 3            # head-only epochs before any backbone weight moves.
+                             # This checkpoint's 2-class head cannot be reused, so ours
+                             # starts random; letting its large early gradients straight
+                             # into a 197M-parameter backbone is the most likely reason
+                             # the first attempt never learned. The ViT never hit this
+                             # because its 3-class head was reusable.
+GRADUAL_UNFREEZE = True      # method 3/131: after the warmup, release the backbone one
+                             # stage at a time from the output end rather than all at
+                             # once, so the late stages adapt before the generic early
+                             # filters are allowed to move at all.
+SNAPSHOT_EPOCHS = 4          # method 29: keep a prediction snapshot every N epochs over
+                             # the last third of training and average them. Free
+                             # diversity inside one run, aimed at the fold-to-fold
+                             # spread that has been this task's main problem.
+                             # 0 disables it.
+LOSS = "weighted_ce"         # "weighted_ce" (method 36) or "logit_adjust" (method 40).
+                             # Logit adjustment subtracts log-prior from the logits
+                             # instead of re-weighting the loss, which targets macro F1
+                             # without the double-correction that wrecked an earlier run.
+LOGIT_ADJUST_TAU = 1.0
 BATCH_SIZE = 4               # convnextv2-large is ~197M params
 GRAD_ACCUM = 2               # effective batch 8
 GRAD_CHECKPOINT = True       # trades ~30% speed for a large memory saving
@@ -111,7 +125,9 @@ EMA_DECAY = 0.99
 MIXUP_PROB = 0.0
 MIXUP_ALPHA = 0.4
 BALANCED_SAMPLER = False
-TTA_SCALES = (1.0,)          # with horizontal flip -> 2 views per image
+TTA_SCALES = (1.0,)          # method 31/138. With horizontal flip this is 2 views;
+                             # (1.0, 0.9, 0.8) gives 6 and (1.0, 0.95, 0.9, 0.85) gives
+                             # 8. More views cost inference time only, never training.
 
 # Blend with a previous run's saved probabilities, e.g. the ViT run's
 # oof_vit.npy / test_prob_vit.npy. The blend weight is chosen on OOF, and the blend
@@ -378,11 +394,24 @@ def train_fold(x_tr, y_tr, seed):
     model = HFClassifier(HF_MODEL_DIR or MODEL_ID, len(CLASSES), DROPOUT).to(DEVICE)
 
     # macro F1 weights all three classes equally while the data does not
-    # (52 Benign vs 80/80), so the loss is inverse-frequency weighted to match it.
+    # (52 Benign vs 80/80), so the loss has to make up the difference.
     counts = np.bincount(y_tr, minlength=len(CLASSES)).astype(np.float32)
     w = counts.sum() / (len(CLASSES) * counts)
-    crit = nn.CrossEntropyLoss(weight=torch.tensor(w, device=DEVICE),
-                               label_smoothing=LABEL_SMOOTHING)
+
+    if LOSS == "logit_adjust":
+        # Method 40. Adding tau * log(prior) to the logits during training makes the
+        # model learn p(y|x) / prior directly, which is what macro F1 rewards. Unlike
+        # re-weighting it does not change the effective sample size of a class, so it
+        # does not stack with the imbalance corrections that collapsed an earlier run.
+        log_prior = torch.tensor(np.log(counts / counts.sum()), device=DEVICE,
+                                 dtype=torch.float32)
+        base = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
+
+        def crit(logits, target):
+            return base(logits + LOGIT_ADJUST_TAU * log_prior, target)
+    else:
+        crit = nn.CrossEntropyLoss(weight=torch.tensor(w, device=DEVICE),
+                                   label_smoothing=LABEL_SMOOTHING)
 
     ds = MammoDataset(x_tr, y_tr, True, seed)
     if BALANCED_SAMPLER:
@@ -397,13 +426,42 @@ def train_fold(x_tr, y_tr, seed):
         loader = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True, drop_last=True,
                             num_workers=2, pin_memory=True)
 
-    # Head warmup: with a randomly initialised 3-way head, the first backward passes
-    # carry large, meaningless gradients. Holding the backbone still until the head is
-    # roughly calibrated keeps them out of 197M pretrained parameters.
-    def set_backbone_trainable(flag: bool) -> None:
+    # Head warmup, then gradual unfreezing. With a randomly initialised 3-way head the
+    # first backward passes carry large, meaningless gradients; holding the backbone
+    # still keeps them out of 197M pretrained parameters. Releasing it one stage at a
+    # time afterwards lets the late, task-specific stages adapt before the generic
+    # early filters are allowed to move.
+    stage_of = {}
+    max_stage = 1
+    for n, _ in model.named_parameters():
+        m = re.search(r"stages?\.(\d+)\.", n) or re.search(r"layer\.(\d+)\.", n)
+        d = (int(m.group(1)) + 1) if m else (0 if any(k in n for k in ("embed", "stem", "patch")) else None)
+        stage_of[n] = d
+        if d is not None:
+            max_stage = max(max_stage, d)
+
+    def set_trainable(unfrozen_from: int | None) -> None:
+        """Unfreeze the head plus every stage at or above `unfrozen_from`.
+
+        None freezes the whole backbone; 0 unfreezes all of it.
+        """
         for n, p in model.named_parameters():
-            if "classifier" not in n:
-                p.requires_grad_(flag)
+            if "classifier" in n:
+                p.requires_grad_(True)
+                continue
+            d = stage_of[n]
+            depth = max_stage if d is None else d
+            p.requires_grad_(unfrozen_from is not None and depth >= unfrozen_from)
+
+    def unfreeze_plan(epoch: int) -> int | None:
+        if epoch < WARMUP_EPOCHS:
+            return None                                   # head only
+        if not GRADUAL_UNFREEZE:
+            return 0                                      # whole backbone at once
+        # Spread the remaining epochs over the stages, deepest released last.
+        span = max(1, EPOCHS - WARMUP_EPOCHS)
+        progressed = (epoch - WARMUP_EPOCHS) / span       # 0 -> 1
+        return max(0, int(round(max_stage * (1.0 - progressed))))
 
     opt = torch.optim.AdamW(param_groups(model, LR), weight_decay=WEIGHT_DECAY)
     steps = max(1, len(loader) // GRAD_ACCUM) * max(1, EPOCHS - WARMUP_EPOCHS)
@@ -414,9 +472,15 @@ def train_fold(x_tr, y_tr, seed):
     scaler = torch.amp.GradScaler("cuda", enabled=amp)
     n_ok = n_skip = 0
 
+    # Method 29: snapshots from the last third of training, averaged at the end. Each
+    # is a different point on the same trajectory, so they disagree in useful ways
+    # without costing a second training run.
+    snapshots = []
+    snapshot_from = int(EPOCHS * 2 / 3)
+
     for epoch in range(EPOCHS):
         warming = epoch < WARMUP_EPOCHS
-        set_backbone_trainable(not warming)
+        set_trainable(unfreeze_plan(epoch))
         model.train()
         opt.zero_grad(set_to_none=True)
         for step, (xb, yb) in enumerate(loader):
@@ -449,33 +513,20 @@ def train_fold(x_tr, y_tr, seed):
                 else:
                     n_skip += 1
 
-    set_backbone_trainable(True)
+        if (SNAPSHOT_EPOCHS and epoch >= snapshot_from
+                and (epoch - snapshot_from) % SNAPSHOT_EPOCHS == 0):
+            snapshots.append({k: v.detach().clone() for k, v in model.state_dict().items()})
+
+    set_trainable(0)
     if n_skip > 0.1 * max(n_ok + n_skip, 1):
         print(f"    WARNING: fp16 overflow skipped {n_skip}/{n_ok + n_skip} steps -- "
               f"set USE_AMP = False", flush=True)
     ema.copy_to(model)
-    return model
+    return model, snapshots
 
 # ---------------------------------------------------------------------------
 # Post-processing
 # ---------------------------------------------------------------------------
-
-
-def confidence_report(prob, label=""):
-    """Flag a fold that produced near-uniform probabilities.
-
-    A 3-class softmax floors at 0.333. A model that learned anything puts most of its
-    mass well above that; one that sits at ~0.39 did not train, however plausible its
-    macro F1 looks. Worth checking every fold, because the macro F1 of a barely-trained
-    model on 42 images can still land near 0.45 by luck.
-    """
-    med = float(np.median(prob.max(1)))
-    frac = float((prob.max(1) > 0.5).mean())
-    msg = f"    confidence{label}: median max-prob {med:.3f}, {frac:.0%} above 0.5"
-    if med < 0.45:
-        msg += "   <-- NEAR-UNIFORM, this fold did not train"
-    print(msg, flush=True)
-    return med
 
 
 def fit_weights(prob, y):
@@ -506,27 +557,68 @@ def cross_fitted(prob, y, seed):
     return pred
 
 
+def _temper(prob, t):
+    """Re-sharpen (t<1) or soften (t>1) a probability vector."""
+    logit = np.log(np.clip(prob, 1e-9, None)) / t
+    e = np.exp(logit - logit.max(1, keepdims=True))
+    return e / e.sum(1, keepdims=True)
+
+
 def try_blend(oof, test_prob, y):
-    """Blend with saved probabilities from an earlier run, if it helps out-of-fold."""
+    """Blend with saved probabilities from an earlier run, if it helps out-of-fold.
+
+    Sweeps the mixing weight and, for each, a temperature on the other run (method 73).
+    A run that is systematically more confident than this one otherwise dominates the
+    argmax whatever weight it is given; tempering lets the weight mean what it says.
+
+    The winner is re-checked cross-fitted before it is shipped, because picking a
+    weight and a temperature against the same 212 rows that then score them is worth
+    several points of self-flattery.
+    """
     if not BLEND_WITH:
         return oof, test_prob
+
     best_oof, best_test = oof, test_prob
-    best = f1_score(y, oof.argmax(1), average="macro")
+    solo = f1_score(y, oof.argmax(1), average="macro")
+    best_cf = solo
+
     for oof_path, test_path in BLEND_WITH:
         if not (os.path.exists(oof_path) and os.path.exists(test_path)):
             print(f"  blend source missing, skipped: {oof_path}")
             continue
-        o2, t2 = np.load(oof_path), np.load(test_path)
-        for a in np.arange(0.1, 1.0, 0.1):
-            cand = f1_score(y, (a * oof + (1 - a) * o2).argmax(1), average="macro")
-            if cand > best + 1e-9:
-                best = cand
-                best_oof = a * oof + (1 - a) * o2
-                best_test = a * test_prob + (1 - a) * t2
-                print(f"  blend with {os.path.basename(oof_path)} at w={a:.1f} "
-                      f"-> OOF {cand:.4f}")
-    if best is not None and best_oof is oof:
-        print("  no blend beat this model alone; shipping it unblended")
+        o2 = np.load(oof_path).astype(np.float64)
+        t2 = np.load(test_path).astype(np.float64)
+        o2 /= o2.sum(1, keepdims=True)
+        t2 /= t2.sum(1, keepdims=True)
+
+        def search(o_a, o_b, yy):
+            best, arg = -1.0, (1.0, 1.0)
+            for temp in (0.5, 0.75, 1.0, 1.5, 2.0):
+                ob = _temper(o_b, temp)
+                for a in np.arange(0.0, 1.01, 0.1):
+                    sc = f1_score(yy, (a * o_a + (1 - a) * ob).argmax(1), average="macro")
+                    if sc > best:
+                        best, arg = sc, (a, temp)
+            return arg
+
+        pred = np.empty(len(y), dtype=np.int64)
+        for tr, va in StratifiedKFold(N_FOLDS, shuffle=True, random_state=0).split(y, y):
+            a, temp = search(oof[tr], o2[tr], y[tr])
+            pred[va] = (a * oof[va] + (1 - a) * _temper(o2, temp)[va]).argmax(1)
+        cf = f1_score(y, pred, average="macro")
+        name = os.path.basename(oof_path)
+        print(f"  blend with {name}: cross-fitted OOF {cf:.4f} (this model alone {solo:.4f})")
+
+        if cf > best_cf + 1e-9:
+            best_cf = cf
+            a, temp = search(oof, o2, y)
+            print(f"    -> shipping it, weight {a:.1f} on this model, temperature "
+                  f"{temp} on {name}")
+            best_oof = a * oof + (1 - a) * _temper(o2, temp)
+            best_test = a * test_prob + (1 - a) * _temper(t2, temp)
+
+    if best_oof is oof:
+        print("  no blend beat this model alone out-of-fold; shipping it unblended")
     return best_oof, best_test
 
 
@@ -568,8 +660,10 @@ def main():
 
     print(f"device={DEVICE}  input={MODEL_H}x{MODEL_W}  folds={N_FOLDS}  seeds={SEEDS}")
     print(f"mixup={MIXUP_PROB}  balanced_sampler={BALANCED_SAMPLER}  tta_scales={TTA_SCALES}")
-    print(f"precision={'fp16' if USE_AMP else 'fp32'}  warmup_epochs={WARMUP_EPOCHS}  "
-          f"epochs={EPOCHS}  llrd={LLRD}")
+    print(f"precision={'fp16' if USE_AMP else 'fp32'}  warmup={WARMUP_EPOCHS}  "
+          f"epochs={EPOCHS}  llrd={LLRD}  loss={LOSS}")
+    print(f"gradual_unfreeze={GRADUAL_UNFREEZE}  snapshot_every={SNAPSHOT_EPOCHS}  "
+          f"tta_views={len(TTA_SCALES) * 2}")
     print(f"model={MODEL_ID}")
     print("\npreprocessing...", flush=True)
     x_train = build_cache(train.image_id, f"{DATA_DIR}/train_images")
@@ -589,11 +683,23 @@ def main():
     for seed in SEEDS:
         for f, (tr, va) in enumerate(StratifiedKFold(N_FOLDS, shuffle=True,
                                                      random_state=seed).split(y, y)):
-            model = train_fold(x_train[tr], y[tr], seed * 100 + f)
+            model, snaps = train_fold(x_train[tr], y[tr], seed * 100 + f)
+            # The EMA weights plus each snapshot, averaged: one training run, several
+            # points on its trajectory, and they disagree in useful ways.
             va_prob = predict(model, x_train[va])
+            te_prob = predict(model, x_test)
+            if snaps:
+                ema_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+                for snap in snaps:
+                    model.load_state_dict(snap)
+                    va_prob += predict(model, x_train[va])
+                    te_prob += predict(model, x_test)
+                model.load_state_dict(ema_state)
+                va_prob /= (1 + len(snaps))
+                te_prob /= (1 + len(snaps))
             confidence_report(va_prob)
             oof[va] += va_prob
-            test_prob += predict(model, x_test)
+            test_prob += te_prob
             n_runs += 1
             s = f1_score(y[va], va_prob.argmax(1), average="macro")
             fold_scores.append(s)
