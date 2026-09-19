@@ -176,22 +176,36 @@ def summarize_keys(sd, n=6):
         print(f"    {k:70s} {tuple(sd[k].shape) if k in sd else ''}")
 
 
-def best_prefix(src_keys, target_keys):
+def best_prefix(src_sd, target_sd):
     """
     Cari prefix yang harus dibuang supaya nama layer checkpoint cocok dengan
     kerangka model yang kita bangun: 'image_encoder.', 'image_encoder.model.',
     'backbone.', 'swinv2.', 'module.', dst. tanpa perlu menebak.
+
+    Sebuah key dihitung cocok hanya kalau nama DAN bentuk tensornya sama, supaya
+    persentase yang dilaporkan tidak menipu (nama sama tapi bentuk beda = bobot
+    dari varian arsitektur lain, dan itu tidak bisa dipakai).
     """
     cands = {""}
-    for k in src_keys:
+    for k in src_sd:
         parts = k.split(".")
         for i in range(1, min(4, len(parts))):
             cands.add(".".join(parts[:i]) + ".")
+
+    def _hits(p):
+        n = 0
+        for k, v in src_sd.items():
+            if k.startswith(p):
+                t = target_sd.get(k[len(p):])
+                if t is not None and tuple(t.shape) == tuple(v.shape):
+                    n += 1
+        return n
+
     best, best_hits = "", -1
     for p in sorted(cands):
-        hits = sum(1 for k in src_keys if k.startswith(p) and k[len(p):] in target_keys)
-        if hits > best_hits:
-            best, best_hits = p, hits
+        h = _hits(p)
+        if h > best_hits:
+            best, best_hits = p, h
     return best, best_hits
 
 
@@ -223,10 +237,51 @@ class HFBackbone(nn.Module):
         return pooled if pooled is not None else out.last_hidden_state.mean(1)
 
 
+def positional_match(src_sd, tgt_sd):
+    """
+    Fallback kalau nama layer tidak cocok sama sekali (mis. bobotnya disimpan
+    dari implementasi EfficientNet lain, bukan timm). Urutan tensor di sebuah
+    state_dict = urutan registrasi modul, jadi dua implementasi arsitektur yang
+    sama menghasilkan DERET BENTUK yang identik. Pemetaan posisional hanya
+    diterima kalau deret bentuknya sama persis, supaya tidak salah pasang diam-
+    diam; arsitektur yang beda (mis. b5 vs b2) otomatis ditolak.
+    """
+    s_items, t_items = list(src_sd.items()), list(tgt_sd.items())
+    if len(s_items) != len(t_items) or not s_items:
+        return None
+    for (_, sv), (_, tv) in zip(s_items, t_items):
+        if tuple(sv.shape) != tuple(tv.shape):
+            return None
+    return {tk: sv for (_, sv), (tk, _) in zip(s_items, t_items)}
+
+
+def _diagnose(sd, module, prefix, n=12):
+    """Cetak semua yang dibutuhkan untuk mendiagnosis kegagalan pencocokan."""
+    tgt = list(module.inner.state_dict().keys())
+    src = list(sd.keys())
+    print("\n" + "=" * 60)
+    print("DIAGNOSTIK PENCOCOKAN BOBOT (salin seluruh blok ini kalau mau dibantu)")
+    print("=" * 60)
+    print(f"[src] {len(src)} key di checkpoint, prefix terbaik = {prefix!r}")
+    for k in src[:n]:
+        print(f"    src  {k:70s} {tuple(sd[k].shape)}")
+    print("    ...")
+    for k in src[-3:]:
+        print(f"    src  {k:70s} {tuple(sd[k].shape)}")
+    print(f"[tgt] {len(tgt)} key di kerangka model")
+    for k in tgt[:n]:
+        print(f"    tgt  {k:70s} {tuple(module.inner.state_dict()[k].shape)}")
+    print("    ...")
+    for k in tgt[-3:]:
+        print(f"    tgt  {k:70s} {tuple(module.inner.state_dict()[k].shape)}")
+    print("=" * 60 + "\n")
+
+
 def match_and_load(candidates, sd, min_cov=0.95):
     """
     candidates: iterable of (label, factory). Bangun tiap kandidat, hitung
-    berapa persen bobotnya bisa dicocokkan, pilih yang terbaik, lalu muat.
+    berapa persen bobotnya bisa dicocokkan lewat nama; kalau nama gagal, coba
+    pemetaan posisional. Pilih yang terbaik, lalu muat.
     Mengembalikan (module, leftover_keys).
     """
     best = None
@@ -236,12 +291,18 @@ def match_and_load(candidates, sd, min_cov=0.95):
         except Exception as e:
             print(f"  - {label:45s} gagal dibuat ({type(e).__name__}: {e})")
             continue
-        tgt = set(module.inner.state_dict().keys())
-        prefix, hits = best_prefix(sd.keys(), tgt)
-        cov = hits / max(len(tgt), 1)
+        tgt = module.inner.state_dict()
+        prefix, hits = best_prefix(sd, tgt)
+        cov, mode, pmap = hits / max(len(tgt), 1), "nama", None
         print(f"  - {label:45s} prefix={prefix!r:22s} cocok {hits}/{len(tgt)} ({cov:.1%})")
+        if cov < min_cov:
+            pmap = positional_match(sd, tgt)
+            if pmap is not None:
+                cov, mode = 1.0, "posisional"
+                print(f"    -> nama tidak cocok, tapi deret bentuk tensornya identik "
+                      f"({len(pmap)} tensor): pakai pemetaan posisional")
         if best is None or cov > best[0]:
-            best = (cov, label, module, prefix)
+            best = (cov, label, module, prefix, mode, pmap)
         if cov > 0.99:
             break
 
@@ -249,31 +310,37 @@ def match_and_load(candidates, sd, min_cov=0.95):
         raise RuntimeError("Tidak ada kerangka model yang bisa dibangun. "
                            "Cek dependensi (timm / transformers).")
 
-    cov, label, module, prefix = best
+    cov, label, module, prefix, mode, pmap = best
     tgt = module.inner.state_dict()
-    matched = {k[len(prefix):]: v for k, v in sd.items()
-               if k.startswith(prefix) and k[len(prefix):] in tgt}
 
-    bad = [k for k, v in matched.items() if tuple(v.shape) != tuple(tgt[k].shape)]
-    for k in bad:
-        matched.pop(k)
-    if bad:
-        print(f"[warn] {len(bad)} tensor dilewati karena bentuknya beda, contoh: {bad[:3]}")
+    if mode == "posisional":
+        print("[warn] Bobot dipasang berdasarkan URUTAN tensor, bukan nama layer. "
+              "Deret bentuknya sama persis, tapi pastikan hasilnya masuk akal "
+              "(cek skor CV; fitur dari bobot yang salah pasang biasanya jeblok).")
+        matched, used = pmap, set(sd.keys())
+    else:
+        matched = {k[len(prefix):]: v for k, v in sd.items()
+                   if k.startswith(prefix) and k[len(prefix):] in tgt}
+        bad = [k for k, v in matched.items() if tuple(v.shape) != tuple(tgt[k].shape)]
+        for k in bad:
+            matched.pop(k)
+        if bad:
+            print(f"[warn] {len(bad)} tensor dilewati karena bentuknya beda, contoh: {bad[:3]}")
+        used = {prefix + k for k in matched}
 
     missing, _ = module.inner.load_state_dict(matched, strict=False)
     loaded = len(tgt) - len(missing)
     print(f"Backbone terpilih : {label}")
-    print(f"Prefix dibuang    : {prefix!r}")
+    print(f"Cara pencocokan   : {mode}" + (f" (prefix {prefix!r})" if mode == "nama" else ""))
     print(f"Bobot ter-load    : {loaded}/{len(tgt)} ({loaded/len(tgt):.1%})")
     if missing:
         print("  contoh missing  :", list(missing)[:5])
     if loaded / len(tgt) < min_cov:
+        _diagnose(sd, module, prefix)
         raise RuntimeError(
-            f"Bobot gagal dicocokkan (<{min_cov:.0%}). Jalankan dengan --inspect "
-            "untuk melihat struktur checkpoint-nya."
+            f"Bobot gagal dicocokkan (<{min_cov:.0%}). Lihat blok DIAGNOSTIK di atas."
         )
 
-    used = {prefix + k for k in matched}
     leftover = {k: v for k, v in sd.items() if k not in used}
     return module, leftover
 
@@ -374,9 +441,12 @@ def load_mammoclip(inspect_only=False):
                                               "logit_scale", "bert", "tokenizer"))}
     print(f"[ckpt] tensor image encoder: {len(img_sd)}")
 
-    # jumlah channel input dibaca langsung dari bobot conv pertama
+    # jumlah channel input dibaca langsung dari bobot conv pertama; kalau nama
+    # layernya tidak standar, ambil tensor 4-D pertama (itu selalu conv stem)
     stem = next((v for k, v in img_sd.items()
                  if k.endswith("conv_stem.weight") or k.endswith("conv1.weight")), None)
+    if stem is None:
+        stem = next((v for v in img_sd.values() if v.dim() == 4), None)
     in_chans = int(stem.shape[1]) if stem is not None else 1
     cfg_name = _cfg_value(ckpt.get("config"), "model", "image_encoder", "name") \
         if isinstance(ckpt, dict) else None
