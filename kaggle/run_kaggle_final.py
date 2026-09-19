@@ -60,23 +60,40 @@ SEEDS = [0]                  # add 1 to halve the fold-to-fold noise, at double 
 # order of magnitude between the two families on purpose: 3e-4 wrecked resnet34 under
 # fp16, and a CNN learning rate would wreck a ViT outright.
 MODELS = [
-    dict(name="resnet34", kind="timm", h=512, w=384, lr=1e-4, epochs=25,
-         batch=16, accum=1, dropout=0.3, wd=1e-2),
+    # amp=False runs this model in fp32. resnet34 scored 0.5842 in fp32 and 0.4410
+    # under fp16 at the same LR, so it keeps full precision; it is small enough that
+    # the extra cost is a couple of minutes.
+    dict(name="resnet34", kind="timm", h=512, w=384, lr=3e-4, epochs=25,
+         batch=16, accum=1, dropout=0.3, wd=1e-2, amp=False),
     dict(name="hugging-science/breast-cancer-detector-2", kind="hf", h=384, w=288,
-         lr=3e-5, epochs=12, batch=8, accum=1, dropout=0.1, wd=0.05),
+         lr=3e-5, epochs=12, batch=8, accum=1, dropout=0.1, wd=0.05, amp=True),
 ]
 
 LABEL_SMOOTHING = 0.05
 EMA_DECAY = 0.99
-MIXUP_PROB = 0.5
+# Mixup and the balanced sampler are off by default. Turning both on cost the ViT
+# 0.052 and collapsed resnet34 to 0.1272, where it predicted Benign for 210 of 212
+# images: the class-weighted loss already corrects the imbalance, and stacking a
+# sampler and mixup on top of it, on 212 images and ~250 optimizer steps, stopped the
+# model learning and let the doubled Benign bias take over.
+MIXUP_PROB = 0.0
 MIXUP_ALPHA = 0.4
-BALANCED_SAMPLER = True
-TTA_SCALES = (1.0, 0.9)      # with flip -> 4 views per image
+BALANCED_SAMPLER = False
+TTA_SCALES = (1.0,)          # with flip -> 2 views per image
 GRAD_CHECKPOINT = False      # turn on if a larger backbone runs out of memory
 
 CLASSES = ["Benign", "Malignant", "Normal"]
 MEAN, STD = 0.449, 0.226
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+# The organisers ask for a reproducible model and may ask for the notebook as
+# evidence, so pin every source of randomness rather than only the seeds. Without
+# this, cuDNN picks algorithms by benchmark timing and two runs of the same notebook
+# disagree on a few images.
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+os.environ.setdefault("PYTHONHASHSEED", "0")
 
 # ---------------------------------------------------------------------------
 # Preprocessing: crop the breast out of the 3540x4740 full-field image
@@ -302,6 +319,7 @@ def mixup(x, y, alpha, rng):
 
 @torch.no_grad()
 def predict(model, images, spec):
+    amp = spec.get("amp", True) and DEVICE == "cuda"
     model.eval()
     total = None
     for scale in TTA_SCALES:
@@ -313,7 +331,7 @@ def predict(model, images, spec):
             out = []
             for xb in loader:
                 xb = xb.to(DEVICE)
-                with torch.amp.autocast("cuda", enabled=DEVICE == "cuda"):
+                with torch.amp.autocast("cuda", enabled=amp):
                     out.append(model(xb).softmax(1).float().cpu().numpy())
             p = np.concatenate(out)
             total = p if total is None else total + p
@@ -324,6 +342,7 @@ def train_fold(x_tr, y_tr, spec, seed):
     torch.manual_seed(seed)
     np.random.seed(seed)
     rng = np.random.default_rng(seed)
+    amp = spec.get("amp", True) and DEVICE == "cuda"
     model = build_model(spec).to(DEVICE)
 
     # macro F1 weights all three classes equally while the data does not
@@ -350,7 +369,7 @@ def train_fold(x_tr, y_tr, spec, seed):
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=spec["lr"], total_steps=steps,
                                                 pct_start=0.25)
     ema = EMA(model, EMA_DECAY)
-    scaler = torch.amp.GradScaler("cuda", enabled=DEVICE == "cuda")
+    scaler = torch.amp.GradScaler("cuda", enabled=amp)
     n_ok = n_skip = 0
 
     for _ in range(spec["epochs"]):
@@ -361,7 +380,7 @@ def train_fold(x_tr, y_tr, spec, seed):
             use_mix = rng.random() < MIXUP_PROB and xb.size(0) > 1
             if use_mix:
                 xb, ya, yb2, lam = mixup(xb, yb, MIXUP_ALPHA, rng)
-            with torch.amp.autocast("cuda", enabled=DEVICE == "cuda"):
+            with torch.amp.autocast("cuda", enabled=amp):
                 logits = model(xb)
                 loss = (lam * crit(logits, ya) + (1 - lam) * crit(logits, yb2)) if use_mix \
                     else crit(logits, yb)
@@ -408,7 +427,8 @@ def confidence_report(prob):
 def run_model(spec, x_train, y, x_test):
     tag = spec["name"].split("/")[-1]
     print("=" * 72)
-    print(f"{tag}  |  {spec['h']}x{spec['w']}  lr={spec['lr']}  epochs={spec['epochs']}")
+    print(f"{tag}  |  {spec['h']}x{spec['w']}  lr={spec['lr']}  epochs={spec['epochs']}  "
+          f"precision={'fp16' if spec.get('amp', True) else 'fp32'}")
     print("=" * 72)
     oof = np.zeros((len(y), len(CLASSES)), dtype=np.float32)
     test_prob = np.zeros((len(x_test), len(CLASSES)), dtype=np.float32)
