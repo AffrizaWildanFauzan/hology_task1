@@ -492,11 +492,23 @@ def main():
     for seed in SEEDS:
         for f, (tr, va) in enumerate(StratifiedKFold(N_FOLDS, shuffle=True,
                                                      random_state=seed).split(y, y)):
-            model = train_fold(x_train[tr], y[tr], seed * 100 + f)
+            model, snaps = train_fold(x_train[tr], y[tr], seed * 100 + f)
+            # EMA weights plus each snapshot, averaged: one training run, several
+            # points on its trajectory, and they disagree in useful ways.
             va_prob = predict(model, x_train[va])
+            te_prob = predict(model, x_test)
+            if snaps:
+                ema_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+                for snap in snaps:
+                    model.load_state_dict(snap)
+                    va_prob += predict(model, x_train[va])
+                    te_prob += predict(model, x_test)
+                model.load_state_dict(ema_state)
+                va_prob /= (1 + len(snaps))
+                te_prob /= (1 + len(snaps))
             confidence_report(va_prob)
             oof[va] += va_prob
-            test_prob += predict(model, x_test)
+            test_prob += te_prob
             n_runs += 1
             print(f"  seed {seed} fold {f}: macroF1 "
                   f"{f1_score(y[va], va_prob.argmax(1), average='macro'):.4f}  "
