@@ -422,21 +422,65 @@ def fit_weights(prob, y):
 # ---------------------------------------------------------------------------
 
 
-def confidence_report(prob, label=""):
-    """Flag a fold that produced near-uniform probabilities.
+def _temper(prob, t):
+    """Re-sharpen (t<1) or soften (t>1) a probability vector."""
+    logit = np.log(np.clip(prob, 1e-9, None)) / t
+    e = np.exp(logit - logit.max(1, keepdims=True))
+    return e / e.sum(1, keepdims=True)
 
-    A 3-class softmax floors at 0.333. A model that learned anything puts most of its
-    mass well above that; one that sits at ~0.39 did not train, however plausible its
-    macro F1 looks. Worth checking every fold, because the macro F1 of a barely-trained
-    model on 42 images can still land near 0.45 by luck.
+
+def try_blend(oof, test_prob, y):
+    """Blend with another run's saved probabilities, if it survives cross-fitting.
+
+    Sweeps the mixing weight and a temperature on the other run (methods 51 and 73).
+    A run that is systematically more confident otherwise dominates the argmax
+    whatever weight it is given, and tempering lets the weight mean what it says.
+    Picking both against the same 212 rows that then score them is worth several
+    points of self-flattery, so the winner is re-checked fold by fold first.
     """
-    med = float(np.median(prob.max(1)))
-    frac = float((prob.max(1) > 0.5).mean())
-    msg = f"    confidence{label}: median max-prob {med:.3f}, {frac:.0%} above 0.5"
-    if med < 0.45:
-        msg += "   <-- NEAR-UNIFORM, this fold did not train"
-    print(msg, flush=True)
-    return med
+    if not BLEND_WITH:
+        return oof, test_prob
+
+    solo = f1_score(y, oof.argmax(1), average="macro")
+    best_oof, best_test, best_cf = oof, test_prob, solo
+
+    def search(a_oof, b_oof, yy):
+        best, arg = -1.0, (1.0, 1.0)
+        for temp in (0.5, 0.75, 1.0, 1.5, 2.0):
+            tb = _temper(b_oof, temp)
+            for a in np.arange(0.0, 1.01, 0.1):
+                sc = f1_score(yy, (a * a_oof + (1 - a) * tb).argmax(1), average="macro")
+                if sc > best:
+                    best, arg = sc, (a, temp)
+        return arg
+
+    for oof_path, test_path in BLEND_WITH:
+        if not (os.path.exists(oof_path) and os.path.exists(test_path)):
+            print(f"  blend source missing, skipped: {oof_path}")
+            continue
+        o2 = np.load(oof_path).astype(np.float64)
+        t2 = np.load(test_path).astype(np.float64)
+        o2 /= o2.sum(1, keepdims=True)
+        t2 /= t2.sum(1, keepdims=True)
+
+        pred = np.empty(len(y), dtype=np.int64)
+        for tr, va in StratifiedKFold(N_FOLDS, shuffle=True, random_state=0).split(y, y):
+            a, temp = search(oof[tr], o2[tr], y[tr])
+            pred[va] = (a * oof[va] + (1 - a) * _temper(o2, temp)[va]).argmax(1)
+        cf = f1_score(y, pred, average="macro")
+        name = os.path.basename(oof_path)
+        print(f"  blend with {name}: cross-fitted {cf:.4f}  (this model alone {solo:.4f})")
+        if cf > best_cf + 1e-9:
+            best_cf = cf
+            a, temp = search(oof, o2, y)
+            print(f"    -> shipping it, weight {a:.1f} here, temperature {temp} on {name}")
+            best_oof = a * oof + (1 - a) * _temper(o2, temp)
+            best_test = a * test_prob + (1 - a) * _temper(t2, temp)
+
+    if best_oof is oof:
+        print("  no blend beat this model alone out-of-fold; shipping it unblended")
+    return best_oof, best_test
+
 
 
 def stage_1_zeroshot(x_train, y):
