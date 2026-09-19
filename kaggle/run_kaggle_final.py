@@ -59,26 +59,38 @@ SEEDS = [0]                  # add 1 to halve the fold-to-fold noise, at double 
 # Each entry trains its own cross-validated ensemble. Learning rates differ by an
 # order of magnitude between the two families on purpose: 3e-4 wrecked resnet34 under
 # fp16, and a CNN learning rate would wreck a ViT outright.
+# Four backbones, chosen for how differently they fail rather than for individual
+# strength. Blending two of them was worth +0.09 out-of-fold (0.6172 alone, 0.7053
+# blended), more than any single-model change tried, and averaging models that make
+# the same mistakes buys nothing.
+#
+# resnet18 is deliberately absent: it is the same family and recipe as resnet34, so it
+# would mostly duplicate its errors. densenet121's dense connectivity and
+# efficientnetv2's training recipe give genuinely different failure modes.
+#
+# They are all small on purpose. 212 training images do not support a large backbone,
+# as the 197M-parameter ConvNeXtV2 run demonstrated when it collapsed to 0.1272.
+#
+# amp=False keeps a model in fp32. resnet34 scored 0.5842 in fp32 against 0.4012 under
+# fp16 on an otherwise identical run, so every CNN here keeps full precision; the ViT
+# is the one family measured to be fine in fp16, and it is also the slowest, so it
+# keeps the speedup.
 MODELS = [
-    # amp=False runs this model in fp32. resnet34 scored 0.5842 in fp32 and 0.4410
-    # under fp16 at the same LR, so it keeps full precision; it is small enough that
-    # the extra cost is a couple of minutes.
     dict(name="resnet34", kind="timm", h=512, w=384, lr=3e-4, epochs=25,
          batch=16, accum=1, dropout=0.3, wd=1e-2, amp=False),
     dict(name="hugging-science/breast-cancer-detector-2", kind="hf", h=384, w=288,
          lr=3e-5, epochs=12, batch=8, accum=1, dropout=0.1, wd=0.05, amp=True),
+    dict(name="tf_efficientnetv2_b0", kind="timm", h=512, w=384, lr=3e-4, epochs=25,
+         batch=16, accum=1, dropout=0.3, wd=1e-2, amp=False),
+    dict(name="densenet121", kind="timm", h=448, w=336, lr=2e-4, epochs=25,
+         batch=12, accum=1, dropout=0.3, wd=1e-2, amp=False),
 
-    # Uncomment to add more backbones. Blending two models that fail differently was
-    # worth +0.09 out-of-fold here (0.6172 alone, 0.7053 blended), far more than any
-    # single-model change tried, so a third and fourth are the cheapest gain left.
-    # These are lightweight on purpose: 212 training images do not support a large
-    # backbone, and the 197M-parameter ConvNeXtV2 bore that out.
-    # dict(name="tf_efficientnetv2_b0", kind="timm", h=512, w=384, lr=3e-4, epochs=25,
-    #      batch=16, accum=1, dropout=0.3, wd=1e-2, amp=False),
+    # Drop a model from the list if the run has to fit a tighter budget. Each CNN
+    # costs roughly 8 minutes of the total on a P100/T4; the ViT costs about 6.
     # dict(name="resnet18", kind="timm", h=512, w=384, lr=3e-4, epochs=25,
     #      batch=16, accum=1, dropout=0.3, wd=1e-2, amp=False),
-    # dict(name="densenet121", kind="timm", h=448, w=336, lr=2e-4, epochs=25,
-    #      batch=12, accum=1, dropout=0.3, wd=1e-2, amp=False),
+    # dict(name="convnext_tiny", kind="timm", h=448, w=336, lr=1e-4, epochs=20,
+    #      batch=12, accum=1, dropout=0.2, wd=0.05, amp=False),
 ]
 
 LABEL_SMOOTHING = 0.05
@@ -276,8 +288,10 @@ def build_model(spec):
 
     url = MIRROR.get(spec["name"])
     if url is None:
-        raise RuntimeError(f"cannot fetch pretrained weights for {spec['name']}; "
-                           f"turn the notebook's internet switch on")
+        raise RuntimeError(
+            f"cannot fetch pretrained weights for {spec['name']}: the download failed "
+            f"and no mirror is configured for it. Turn the notebook's internet switch "
+            f"on, or drop this entry from MODELS.")
     cached = "/tmp/" + url.rsplit("/", 1)[-1]
     if not os.path.exists(cached):
         torch.hub.download_url_to_file(url, cached, progress=False)
@@ -523,10 +537,19 @@ def main():
 
     oofs, tests, tags = [], [], []
     for spec in MODELS:
-        o, t, tag = run_model(spec, x_train, y, x_test)
+        try:
+            o, t, tag = run_model(spec, x_train, y, x_test)
+        except Exception as exc:
+            # With several backbones in one run, one that cannot load its weights or
+            # runs out of memory should not discard the ones already trained.
+            print(f"  SKIPPED {spec['name']}: {type(exc).__name__}: {exc}\n", flush=True)
+            torch.cuda.empty_cache()
+            continue
         oofs.append(o)
         tests.append(t)
         tags.append(tag)
+    if not oofs:
+        raise RuntimeError("every model failed; nothing to submit")
 
     print("=" * 72)
     print("BLEND")
