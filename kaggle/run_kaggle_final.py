@@ -67,6 +67,18 @@ MODELS = [
          batch=16, accum=1, dropout=0.3, wd=1e-2, amp=False),
     dict(name="hugging-science/breast-cancer-detector-2", kind="hf", h=384, w=288,
          lr=3e-5, epochs=12, batch=8, accum=1, dropout=0.1, wd=0.05, amp=True),
+
+    # Uncomment to add more backbones. Blending two models that fail differently was
+    # worth +0.09 out-of-fold here (0.6172 alone, 0.7053 blended), far more than any
+    # single-model change tried, so a third and fourth are the cheapest gain left.
+    # These are lightweight on purpose: 212 training images do not support a large
+    # backbone, and the 197M-parameter ConvNeXtV2 bore that out.
+    # dict(name="tf_efficientnetv2_b0", kind="timm", h=512, w=384, lr=3e-4, epochs=25,
+    #      batch=16, accum=1, dropout=0.3, wd=1e-2, amp=False),
+    # dict(name="resnet18", kind="timm", h=512, w=384, lr=3e-4, epochs=25,
+    #      batch=16, accum=1, dropout=0.3, wd=1e-2, amp=False),
+    # dict(name="densenet121", kind="timm", h=448, w=336, lr=2e-4, epochs=25,
+    #      batch=12, accum=1, dropout=0.3, wd=1e-2, amp=False),
 ]
 
 LABEL_SMOOTHING = 0.05
