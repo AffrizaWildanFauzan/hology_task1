@@ -31,7 +31,13 @@ from torch.utils.data import DataLoader, Dataset
 # ----------------------------------------------------------------------------
 DATA_DIR = "/kaggle/input/holomine-breast-cancer-classification-task-1"
 OUT_CSV = "/kaggle/working/submission.csv"
-WEIGHTS_DIR = None            # set to a Kaggle mount to run with internet off
+# Offline fallback. Kaggle competition notebooks often must run with the internet
+# switch OFF, and `pretrained=True` then fails. Attach the checkpoint as a Kaggle
+# Dataset and point WEIGHTS_FILE at it; the model builder tries, in order:
+#   timm/torchvision download -> GitHub mirror -> this local file.
+WEIGHTS_FILE = None           # e.g. "/kaggle/input/resnet34-imagenet/resnet34-43635321.pth"
+MIRROR_URL = ("https://github.com/huggingface/pytorch-image-models/releases/download/"
+              "v0.1-weights/resnet34-43635321.pth")
 
 IMG_H, IMG_W = 512, 384
 MODEL_NAME = "resnet34"
@@ -48,8 +54,6 @@ EMA_DECAY = 0.99
 CLASSES = ["Benign", "Malignant", "Normal"]
 MEAN, STD = 0.449, 0.226
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-if WEIGHTS_DIR:
-    os.environ["TORCH_HOME"] = WEIGHTS_DIR
 
 # ----------------------------------------------------------------------------
 # Preprocessing: crop the breast out of the 3540x4740 full-field image
@@ -139,11 +143,52 @@ class MammoDataset(Dataset):
 # ----------------------------------------------------------------------------
 
 
-def build_model():
+def _bare_model():
+    """The architecture with a 3-way head and no weights loaded."""
     try:
         import timm
-        return timm.create_model(MODEL_NAME, pretrained=True, num_classes=3, drop_rate=DROPOUT)
+        return timm.create_model(MODEL_NAME, pretrained=False, num_classes=3, drop_rate=DROPOUT)
+    except ImportError:
+        import torchvision.models as tvm
+        m = getattr(tvm, MODEL_NAME)(weights=None)
+        if hasattr(m, "fc"):
+            m.fc = nn.Sequential(nn.Dropout(DROPOUT), nn.Linear(m.fc.in_features, 3))
+        else:
+            in_f = m.classifier[-1].in_features
+            m.classifier = nn.Sequential(nn.Dropout(DROPOUT), nn.Linear(in_f, 3))
+        return m
+
+
+def _load_checkpoint(model, path):
+    """Load ImageNet weights, dropping the 1000-way head ours replaces."""
+    state = torch.load(path, map_location="cpu", weights_only=True)
+    own = model.state_dict()
+    state = {k: v for k, v in state.items() if k in own and own[k].shape == v.shape}
+    missing, _ = model.load_state_dict(state, strict=False)
+    body = [k for k in missing if not any(h in k for h in ("fc.", "classifier."))]
+    if body:
+        raise RuntimeError(f"backbone keys did not load: {sorted(body)[:8]}")
+    return model
+
+
+_WEIGHT_SOURCE = None
+
+
+def build_model():
+    """ImageNet-pretrained backbone, with fallbacks so an offline run still works."""
+    global _WEIGHT_SOURCE
+
+    try:                                        # 1. normal download (internet ON)
+        import timm
+        m = timm.create_model(MODEL_NAME, pretrained=True, num_classes=3, drop_rate=DROPOUT)
+        _WEIGHT_SOURCE = _WEIGHT_SOURCE or "timm download"
+        return m
+    except ImportError:
+        pass
     except Exception:
+        pass
+
+    try:
         import torchvision.models as tvm
         m = getattr(tvm, MODEL_NAME)(weights="DEFAULT")
         if hasattr(m, "fc"):
@@ -151,7 +196,20 @@ def build_model():
         else:
             in_f = m.classifier[-1].in_features
             m.classifier = nn.Sequential(nn.Dropout(DROPOUT), nn.Linear(in_f, 3))
+        _WEIGHT_SOURCE = _WEIGHT_SOURCE or "torchvision download"
         return m
+    except Exception:
+        pass
+
+    if WEIGHTS_FILE and os.path.exists(WEIGHTS_FILE):   # 2. attached Kaggle Dataset
+        _WEIGHT_SOURCE = _WEIGHT_SOURCE or f"local file {WEIGHTS_FILE}"
+        return _load_checkpoint(_bare_model(), WEIGHTS_FILE)
+
+    cached = "/tmp/" + MIRROR_URL.rsplit("/", 1)[-1]    # 3. GitHub mirror
+    if not os.path.exists(cached):
+        torch.hub.download_url_to_file(MIRROR_URL, cached, progress=False)
+    _WEIGHT_SOURCE = _WEIGHT_SOURCE or "GitHub mirror"
+    return _load_checkpoint(_bare_model(), cached)
 
 
 class EMA:
@@ -250,6 +308,9 @@ def main():
     x_train = build_cache(train.image_id, f"{DATA_DIR}/train_images")
     x_test = build_cache(test.image_id, f"{DATA_DIR}/test_images")
     print(f"  done in {time.time() - t0:.0f}s  {x_train.shape} {x_test.shape}", flush=True)
+
+    build_model()   # resolve the weight source once, up front, and say which it is
+    print(f"ImageNet weights from: {_WEIGHT_SOURCE}", flush=True)
 
     oof = np.zeros((len(y), 3), dtype=np.float32)
     test_prob = np.zeros((len(test), 3), dtype=np.float32)
