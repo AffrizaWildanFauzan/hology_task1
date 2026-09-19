@@ -116,6 +116,33 @@ LOGIT_ADJUST_TAU = 1.0
 BLEND_WITH = []            # e.g. [("/kaggle/input/prev/oof_r34.npy",
                            #        "/kaggle/input/prev/test_r34.npy")]
 
+# ---------------------------------------------------------------------------
+# A second opinion from a mammography-trained checkpoint
+#
+# abdullahtahir/resnet50-mammography-birads is the only public checkpoint found that
+# matches this task on all three axes: it is mammography (not ultrasound, not
+# histopathology), it has our exact three classes, and it reports 84.5% accuracy /
+# 0.9665 AUC over 5-fold CV on 5,662 King Abdulaziz University images.
+#
+# It ships as a Keras .keras file, so it cannot join the PyTorch training loop. It
+# does not need to: it is used untouched, predicting on our images without ever
+# seeing our labels, which makes its predictions out-of-sample by construction and
+# therefore honest to blend against our out-of-fold ones.
+#
+# Two things are unknown and therefore measured rather than assumed:
+#
+#   * Its class ORDER. The model card lists "Normal (BI-RADS 1), Benign (BI-RADS 2-3),
+#     Malignant (BI-RADS 4-5)", which is not our order. All six permutations are
+#     scored on the 212 labelled training images and the best is taken -- that is
+#     aligning indices against known labels, not fitting a model.
+#   * Its PREPROCESSING, which the card does not document. Both plausible
+#     conventions are tried and the better one reported.
+#
+# Download the .keras file into a Kaggle Dataset and point KERAS_MODEL_PATH at it,
+# or leave it None to skip this entirely.
+# ---------------------------------------------------------------------------
+KERAS_MODEL_PATH = None    # e.g. "/kaggle/input/mammo-birads/resnet50_mammography_best.keras"
+
 CLASSES = ["Benign", "Malignant", "Normal"]
 MEAN, STD = 0.449, 0.226
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -497,6 +524,88 @@ def try_blend(oof, test_prob, y):
 
 
 
+# ---------------------------------------------------------------------------
+# Mammography-trained second opinion (Keras)
+# ---------------------------------------------------------------------------
+
+
+def keras_second_opinion(x_train, x_test, y):
+    """Predict with the mammography Keras checkpoint, aligning its classes to ours.
+
+    Returns (oof_like, test_prob) or (None, None) if it is not configured or cannot
+    be read. The predictions on x_train are out-of-sample by construction: this model
+    was trained on a different dataset and never sees our labels, so blending its
+    output against our out-of-fold predictions is honest.
+    """
+    if not KERAS_MODEL_PATH or not os.path.exists(KERAS_MODEL_PATH):
+        return None, None
+
+    import itertools
+    import tensorflow as tf
+
+    print("=" * 68)
+    print("SECOND OPINION -- abdullahtahir/resnet50-mammography-birads (Keras)")
+    print("=" * 68)
+    model = tf.keras.models.load_model(KERAS_MODEL_PATH, compile=False)
+
+    # Read the expected input geometry off the model rather than guessing it.
+    shape = model.input_shape
+    h, w, c = (shape[1] or 224), (shape[2] or 224), (shape[3] or 3)
+    n_out = int(model.output_shape[-1])
+    print(f"  input {h}x{w}x{c}, {n_out} outputs")
+    if n_out != len(CLASSES):
+        print(f"  -> {n_out} outputs cannot map onto {len(CLASSES)} classes; skipping")
+        return None, None
+
+    def run(images, mode):
+        batch = np.stack([cv2.resize(im, (w, h), interpolation=cv2.INTER_AREA)
+                          for im in images]).astype(np.float32)
+        batch = np.repeat(batch[..., None], c, axis=-1)
+        if mode == "caffe":
+            # What tf.keras.applications.resnet50.preprocess_input does: BGR order
+            # and per-channel ImageNet mean subtraction, no scaling.
+            batch = batch[..., ::-1] - np.array([103.939, 116.779, 123.68], np.float32)
+        else:
+            batch = batch / 255.0
+        out = model.predict(batch, batch_size=16, verbose=0)
+        out = np.asarray(out, dtype=np.float64)
+        if not np.allclose(out.sum(1), 1.0, atol=1e-3):      # logits, not probabilities
+            e = np.exp(out - out.max(1, keepdims=True))
+            out = e / e.sum(1, keepdims=True)
+        return out / out.sum(1, keepdims=True)
+
+    # The card documents neither the preprocessing nor the class order, so both are
+    # resolved against the 212 labelled images instead of assumed.
+    best = None
+    for mode in ("caffe", "scale"):
+        prob = run(x_train, mode)
+        for perm in itertools.permutations(range(len(CLASSES))):
+            sc = f1_score(y, prob[:, perm].argmax(1), average="macro")
+            if best is None or sc > best[0]:
+                best = (sc, mode, perm)
+    score, mode, perm = best
+    print(f"  best: preprocessing={mode}  class order={perm}  macro F1 {score:.4f}"
+          f"   (chance ~0.33)")
+    print(f"    reading its outputs as " +
+          ", ".join(f"{CLASSES[i]}<-idx{p}" for i, p in enumerate(perm)))
+
+    if score < 0.40:
+        print("  -> at chance on our images; the domain gap is too wide. Skipping.")
+        return None, None
+
+    oof_like = run(x_train, mode)[:, perm]
+    test_prob = run(x_test, mode)[:, perm]
+    confidence_report(oof_like)
+    print("confusion (rows=true, cols=pred), order " + ", ".join(CLASSES))
+    for row in confusion_matrix(y, oof_like.argmax(1)):
+        print("   ", row)
+    np.save("/kaggle/working/oof_keras_mammo.npy", oof_like)
+    np.save("/kaggle/working/test_keras_mammo.npy", test_prob)
+    print()
+    del model
+    return oof_like, test_prob
+
+
 def stage_1_zeroshot(x_train, y, size):
     """Score the checkpoint untouched. Cheap, and it decides whether stage 2 is worth it."""
     print("=" * 68)
@@ -634,6 +743,37 @@ def main():
     oof, test_prob = blend_variants(oofs, tests, tags, y)
     np.save("/kaggle/working/oof_vit.npy", oof)
     np.save("/kaggle/working/test_prob_vit.npy", test_prob)
+
+    k_oof, k_test = keras_second_opinion(x_train, x_test, y)
+    if k_oof is not None:
+        # The Keras model fails differently from a fine-tuned ViT -- different
+        # architecture, different training set, different modality history -- which is
+        # the only reason averaging them is worth anything.
+        solo = f1_score(y, oof.argmax(1), average="macro")
+        best_a, best_sc = None, solo
+        pred = np.empty(len(y), dtype=np.int64)
+        for tr, va in StratifiedKFold(N_FOLDS, shuffle=True, random_state=0).split(y, y):
+            a_best, s_best = 1.0, -1.0
+            for a in np.arange(0.0, 1.01, 0.1):
+                sc = f1_score(y[tr], (a * oof[tr] + (1 - a) * k_oof[tr]).argmax(1),
+                              average="macro")
+                if sc > s_best:
+                    a_best, s_best = a, sc
+            pred[va] = (a_best * oof[va] + (1 - a_best) * k_oof[va]).argmax(1)
+        cf = f1_score(y, pred, average="macro")
+        print(f"  ViT + mammography checkpoint: cross-fitted {cf:.4f}  "
+              f"(ViT alone {solo:.4f})")
+        if cf > solo:
+            for a in np.arange(0.0, 1.01, 0.1):
+                sc = f1_score(y, (a * oof + (1 - a) * k_oof).argmax(1), average="macro")
+                if sc > best_sc:
+                    best_a, best_sc = a, sc
+            if best_a is not None:
+                print(f"    -> shipping it, weight {best_a:.1f} on the ViT")
+                oof = best_a * oof + (1 - best_a) * k_oof
+                test_prob = best_a * test_prob + (1 - best_a) * k_test
+        else:
+            print("    -> does not hold up out-of-fold; keeping the ViT alone")
 
     oof, test_prob = try_blend(oof, test_prob, y)
 
