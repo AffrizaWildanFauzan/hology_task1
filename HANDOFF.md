@@ -476,49 +476,77 @@ python src/tune_and_submit.py --run artifacts/r34 artifacts/eb0 --out submission
 
 ## 8. Hasil
 
-### 8.1 Status
+### 8.1 Papan skor
 
-**Skor OOF final belum tersedia saat dokumen ini ditulis.** Run resnet34 5-fold x
-25 epoch sedang berjalan di CPU (~2,8 jam). Bagian ini akan diperbarui dengan angka
-nyata begitu selesai. Yang sudah terverifikasi ada di bawah.
+Semua angka di bawah out-of-fold pada 212 citra latih. Yang bertanda *cross-fitted*
+berarti parameternya dipasang di 4 fold lalu dinilai di fold ke-5, jadi tidak
+memasang dan menilai pada baris yang sama.
 
-Reviewer: kalau Anda membaca ini dan §8.4 masih kosong, **jangan menilai kualitas
-model** -- belum ada angkanya. Tetap kerjakan §10 bagian A, B, C, E (kebenaran kode,
-kepatuhan aturan, format, reproduktibilitas); bagian D butuh angka.
+| Run | OOF | Papan publik | Catatan |
+|---|---|---|---|
+| ViT ultrasonografi, konfigurasi sederhana | **0.6401** | **0.68888** | submission terbaik tim |
+| resnet34 lokal, CPU fp32, LR 3e-4 | 0.5842 | — | sehat, kalibrasi bagus |
+| ViT, konfigurasi + mixup/balanced sampler | 0.5881 | — | turun 0.052 dari versi sederhana |
+| resnet34 Kaggle fp16, LR 3e-4 | 0.4410 | — | undertrained, lihat §8.3 |
+| resnet34 Kaggle fp16, LR 1e-4 + mixup/sampler | 0.1272 | — | runtuh total, lihat §8.3 |
+| **blend resnet34 lokal + ViT (0.35/0.65)** | **0.6615** *(cross-fitted)* | belum | tertinggi |
 
-### 8.2 Yang sudah terverifikasi
+### 8.2 Dua kegagalan yang terjadi, dan penyebabnya
 
-| Komponen | Status | Bukti |
-|---|---|---|
-| Preprocessing 266 citra | LULUS | 35 detik, cache 34 MB, 0 kegagalan crop |
-| Verifikasi visual crop | LULUS | contact sheet 6 citra/kelas: payudara terisolasi, orientasi seragam, anotasi hilang |
-| Bobot ImageNet termuat | LULUS | resnet34 216 tensor, efficientnet_b0 358 tensor; loss turun 0.78 -> 0.37 dalam 15 epoch (inisialisasi acak tidak berperilaku begini) |
-| Rantai train -> tune -> submit | LULUS | smoke run 2-fold x 2-epoch menghasilkan CSV yang lolos validator |
-| Format submission | LULUS | `src/validate_submission.py` |
+**Kegagalan 1 -- fp16 membuat fold undertrained.** Run resnet34 pertama di Kaggle
+menghasilkan OOF 0.4410 dari sepuluh model, sementara lima model yang sama di CPU
+fp32 menghasilkan 0.5842. Probabilitasnya yang menjelaskan: median max-prob 0.388
+terhadap lantai 0.333 untuk tiga kelas, dengan 0.9% prediksi di atas 0.5 dan tidak
+ada satu pun di atas 0.8; run lokal duduk di 0.757 dengan 89.6% di atas 0.5.
+Mengalikan probabilitasnya dengan `[0.903, 1.049, 1.049]` membalik seperempat
+prediksinya, sementara pengali yang sama tidak mengubah apa pun di run lokal.
 
-### 8.3 Batasan lingkungan tempat angka ini dihasilkan
+Sebabnya: di fp16, `GradScaler` membuang step yang gradiennya overflow, tapi loop
+latihan tetap memajukan jadwal LR dan EMA. Sudah diperbaiki -- keduanya sekarang
+digerbangi oleh skala scaler.
 
-Angka lokal dihasilkan di mesin **tanpa GPU** (4 vCPU), dengan **satu seed**, dan
-proxy memblokir `download.pytorch.org` serta `huggingface.co` sehingga bobot ImageNet
-diambil dari mirror GitHub (`src/fetch_weights.py`).
+**Kegagalan 2 -- regularisasi bertumpuk.** Penambahan mixup dan balanced sampler
+menurunkan ViT dari 0.6401 ke 0.5881 dan meruntuhkan resnet34 ke 0.1272. Yang
+terakhir menebak `Benign` untuk 210 dari 212 citra; macro F1-nya praktis sama dengan
+menebak Benign untuk semuanya (0.1313).
 
-**Perlakukan angka lokal sebagai validasi bahwa pipeline-nya benar, bukan sebagai
-estimasi kualitas model akhir.** Konfigurasi Kaggle (`kaggle/run_kaggle.py`) memakai
-2 seed dan bisa di-ensemble dengan backbone kedua; hasilnya akan berbeda -- dan
-seharusnya lebih baik serta lebih stabil.
+Sebabnya: dua koreksi ketidakseimbangan ditumpuk -- bobot kelas pada loss *dan*
+balanced sampler -- lalu mixup di atasnya. Pada 212 citra dengan ~250 langkah
+optimizer, model berhenti belajar dan bias Benign ganda mengambil alih. Terukur juga
+pada ViT, yang prediksi Benign-nya naik dari 31% ke 40% terhadap prior 24.5%.
 
-### 8.4 Skor OOF
+**Pelajaran untuk reviewer:** kedua kegagalan lolos dari macro F1 tanpa terlihat
+aneh. Yang menangkap keduanya adalah memeriksa *confidence* prediksi, bukan skornya.
+`confidence_report()` sekarang mencetak median max-prob per fold dan menandai fold
+yang mendekati seragam.
 
-<!-- Diisi setelah run selesai. Format yang akan diisi:
-     - OOF macro F1 plain argmax
-     - OOF macro F1 tuned (cross-fitted)  <- INI angka yang dikutip
-     - 95% CI bootstrap
-     - simulasi LB publik (16 citra)
-     - F1 per kelas + matriks konfusi
-     - distribusi prediksi pada test set
--->
+### 8.3 Mengapa blending menang
 
-*(belum tersedia -- lihat §8.1)*
+| Model | recall Normal | precision Normal | recall Benign | Normal vs abnormal | Benign vs Malignant |
+|---|---|---|---|---|---|
+| ViT | 0.675 | 0.750 | 0.577 | **0.792** | 0.737 |
+| resnet34 | **0.963** | 0.554 | 0.327 | 0.693 | **0.800** |
+
+Keduanya salah ke arah berlawanan: resnet34 terlalu sering menebak Normal (65.6%
+prediksinya), ViT terlalu sering menebak Benign (40.1%). Digabung 0.35/0.65, blend
+OOF jatuh ke 25.5% Benign -- hampir persis prior 24.5%. Itu sebabnya ia menang.
+
+`src/blend.py` melakukan pencarian bobot ini dari berkas `.npy` yang sudah ditulis
+tiap run, tanpa GPU dan tanpa slot submission.
+
+### 8.4 Risiko terbuka pada blend
+
+Prediksi test-nya 46% Benign sementara prediksi OOF-nya 25.5%. Ketidakcocokan itu
+berasal dari ViT, yang pada test set lebih condong Benign lagi (53.7%). Belum bisa
+dipastikan apakah test set memang berbeda komposisinya atau kalibrasi ViT bergeser.
+Submission yang mencetak 0.68888 juga condong Benign (19 dari 54), jadi polanya bukan
+hal baru.
+
+### 8.5 Batasan lingkungan angka lokal
+
+Angka resnet34 lokal dihasilkan di mesin **tanpa GPU** (4 vCPU), satu seed, dengan
+bobot ImageNet dari mirror GitHub karena proxy memblokir `download.pytorch.org` dan
+`huggingface.co`.
 
 
 ---
