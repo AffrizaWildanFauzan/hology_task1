@@ -1,44 +1,52 @@
-"""HoloMine Task 1 -- ConvNeXtV2-large pipeline with the variance controls that the
-first real run showed were needed.
+"""HoloMine Task 1 -- ConvNeXtV2-large, after the first attempt failed outright.
 
 Paste into one Kaggle notebook cell. Internet switch ON (the checkpoint comes from
 Hugging Face); for an offline run, attach the repo as a Kaggle Model input and point
-HF_MODEL_DIR at it.
+HF_MODEL_DIR at it. Runtime is roughly 20-25 min per seed on a P100/T4.
 
-WHY THIS SCRIPT EXISTS
-----------------------
-The first real run (ViT, hugging-science/breast-cancer-detector-2) came back with
-OOF macro F1 0.6401 and per-fold scores of 0.69, 0.57, 0.50, 0.69, 0.75. That spread
--- a quarter of a point between the best and worst fold on 42 validation images each --
-is the single biggest problem to attack. It is not model capacity. So most of what is
-added here fights variance rather than chasing a fancier architecture:
+WHAT WENT WRONG THE FIRST TIME
+------------------------------
+The first ConvNeXtV2 run returned OOF macro F1 0.1313, which is exactly the score of
+predicting Benign for all 212 images. Four things were wrong. The MISMATCH lines in
+that log were not among them: only `classifier.weight` and `classifier.bias` differ,
+because this checkpoint has a two-class benign/malignant head and the task has three
+classes. The whole 197M-parameter backbone loaded fine, and a two-class head cannot
+be mapped onto a three-class problem -- there is no version of this where it matches.
 
-  * repeated CV over several seeds, averaged
-  * mixup, which is worth more on 212 images than any backbone swap
-  * layer-wise LR decay, so a 197M-parameter backbone is not wrecked by one LR
-  * multi-scale + flip TTA instead of flip alone
-  * balanced sampling on top of the class-weighted loss
-  * optional blending with a previous run's saved probabilities, chosen on OOF
+  1. The layer-wise LR decay did nothing. `LLRD ** (1.0 - depth) / LLRD` spans 1.000
+     to 1.333 across the network, so every layer trained at one rate, and the ramp ran
+     backwards. It now spans `LLRD ** depth`: the stem trains at 1.27e-5 against 4e-5
+     for the last stage.
+  2. It built one parameter group per tensor, roughly 400 of them, each handed to
+     OneCycleLR as its own max_lr. Now six, one per depth.
+  3. The freshly initialised head ran at 4e-4 straight into the pretrained backbone
+     from step one. WARMUP_EPOCHS now freezes the backbone until the head settles.
+     This is the clearest difference from the ViT run that worked: that checkpoint's
+     three-class head was reusable as a warm start, so it never took the shock.
+  4. mixup, the balanced sampler and fp16 were all on. Each has since been measured
+     to hurt here, and all three now default off.
 
 ABOUT THIS CHECKPOINT
 ---------------------
-ALM-AHME/convnextv2-large-...-BreakHis was fine-tuned on BreakHis, which is breast
-*histopathology* -- microscope images of biopsy slides -- not mammography. That is a
-third imaging modality, as unlike our X-ray projections as the ultrasound checkpoint
-was. Its 99.01% accuracy is a histopathology number and does not transfer.
+ALM-AHME/convnextv2-large-...-BreakHis was fine-tuned on BreakHis: breast
+*histopathology*, microscope images of biopsy slides, not mammography. Its 99.01%
+accuracy is a two-class histopathology number measured on that data, and it does not
+carry over -- the model has no notion of "normal" and has never seen an X-ray
+projection. What we are borrowing is the backbone, not its verdicts.
 
-It also has only TWO classes (benign, malignant) and no "normal", so its head cannot
-be reused; the script detects this and re-initialises a 3-way head automatically.
+The ViT run established that a zero-shot score says little: that checkpoint scored
+0.1922 zero-shot, collapsing onto one class, then fine-tuned to 0.6401. Stage 1 runs
+because it is cheap, but read it as a sanity check, not a verdict.
 
-What the ViT run established is that the zero-shot score says little: that checkpoint
-scored 0.1922 zero-shot, collapsing onto one class, then fine-tuned to 0.6401. The
-pretrained *features* transfer even when the pretrained *head* does not. Stage 1 is
-still run here because it is cheap, but read it as a sanity check, not as a verdict.
+HONEST EXPECTATION
+------------------
+197M parameters against 212 training images and a few hundred optimizer steps is a
+poor ratio. The value here is probably not this model alone but its errors differing
+from the other two, which is what BLEND_WITH is for. Judge it on OOF against the
+0.6172 the ViT reached, and drop it if it does not clear that bar.
 
 No external data, no LLM/VLM, no AutoML, no Ultralytics. A publicly available
 pretrained classifier, which the rules permit.
-
-Runtime: roughly 12-18 min per seed on a P100/T4 at these settings.
 """
 from __future__ import annotations
 
@@ -58,7 +66,7 @@ from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-DATA_DIR = "/kaggle/input/holomine-breast-cancer-classification-task-1"
+DATA_DIR = "/kaggle/input/competitions/holomine-breasts-cancer-classification-task-1"
 WORK_DIR = "/kaggle/working"
 OUT_CSV = f"{WORK_DIR}/submission.csv"
 
