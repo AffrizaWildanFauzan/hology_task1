@@ -138,10 +138,18 @@ BLEND_WITH = []            # e.g. [("/kaggle/input/prev/oof_r34.npy",
 #   * Its PREPROCESSING, which the card does not document. Both plausible
 #     conventions are tried and the better one reported.
 #
-# Download the .keras file into a Kaggle Dataset and point KERAS_MODEL_PATH at it,
-# or leave it None to skip this entirely.
+# It is fetched straight from the Hub at run time, exactly like the ViT above, so
+# there is nothing to upload. Set USE_KERAS_MAMMO = False to skip it.
+#
+# On the rules: a checkpoint is a pretrained model, not data. "Dilarang menggunakan
+# data eksternal untuk melakukan prediksi" bars outside *data*; "diperbolehkan
+# menggunakan pretrained model ... yang tersedia secara publik" permits exactly this,
+# and it is the same permission the ViT already relies on.
 # ---------------------------------------------------------------------------
-KERAS_MODEL_PATH = None    # e.g. "/kaggle/input/mammo-birads/resnet50_mammography_best.keras"
+USE_KERAS_MAMMO = True
+KERAS_REPO = "abdullahtahir/resnet50-mammography-birads"
+KERAS_FILE = "resnet50_mammography_best.keras"
+KERAS_MODEL_PATH = None    # set a local path to load from disk instead of the Hub
 
 CLASSES = ["Benign", "Malignant", "Normal"]
 MEAN, STD = 0.449, 0.226
@@ -537,16 +545,28 @@ def keras_second_opinion(x_train, x_test, y):
     was trained on a different dataset and never sees our labels, so blending its
     output against our out-of-fold predictions is honest.
     """
-    if not KERAS_MODEL_PATH or not os.path.exists(KERAS_MODEL_PATH):
+    if not USE_KERAS_MAMMO:
         return None, None
 
     import itertools
-    import tensorflow as tf
 
     print("=" * 68)
-    print("SECOND OPINION -- abdullahtahir/resnet50-mammography-birads (Keras)")
+    print(f"SECOND OPINION -- {KERAS_REPO} (Keras)")
     print("=" * 68)
-    model = tf.keras.models.load_model(KERAS_MODEL_PATH, compile=False)
+
+    path = KERAS_MODEL_PATH
+    try:
+        import tensorflow as tf
+        if not path:
+            from huggingface_hub import hf_hub_download
+            path = hf_hub_download(repo_id=KERAS_REPO, filename=KERAS_FILE)
+            print(f"  fetched from the Hub ({os.path.getsize(path) / 1e6:.0f} MB)")
+        model = tf.keras.models.load_model(path, compile=False)
+    except Exception as exc:
+        # TensorFlow missing, the notebook offline, or the repo moved. None of those
+        # should cost us the ViT run that has already finished.
+        print(f"  unavailable ({type(exc).__name__}: {exc}); continuing without it\n")
+        return None, None
 
     # Read the expected input geometry off the model rather than guessing it.
     shape = model.input_shape
