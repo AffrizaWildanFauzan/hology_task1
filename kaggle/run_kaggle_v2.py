@@ -43,6 +43,7 @@ Runtime: roughly 12-18 min per seed on a P100/T4 at these settings.
 from __future__ import annotations
 
 import os
+import re
 import time
 
 import cv2
@@ -73,10 +74,19 @@ MODEL_H, MODEL_W = 384, 288  # ConvNeXt is fully convolutional -- any size works
 N_FOLDS = 5
 SEEDS = [0, 1]               # repeated CV. The fold spread in the ViT run was 0.25,
                              # so averaging seeds is the highest-value knob here.
-EPOCHS = 12
+EPOCHS = 16
+WARMUP_EPOCHS = 3            # head-only epochs before the backbone is unfrozen.
+                             # This checkpoint's 2-class head cannot be reused, so
+                             # ours starts random; letting its large early gradients
+                             # straight into a 197M-parameter backbone is the most
+                             # likely reason the first attempt never learned. The ViT
+                             # never hit this because its 3-class head was reusable.
 BATCH_SIZE = 4               # convnextv2-large is ~197M params
 GRAD_ACCUM = 2               # effective batch 8
 GRAD_CHECKPOINT = True       # trades ~30% speed for a large memory saving
+USE_AMP = False              # resnet34 scored 0.5842 in fp32 and 0.4012 under fp16 on
+                             # an otherwise identical run; fp32 is the safe default for
+                             # a model that is failing to train
 LR = 4e-5
 LLRD = 0.75                  # layer-wise LR decay: early layers train slower
 HEAD_LR_MULT = 10.0          # the fresh 3-way head needs a much higher LR
@@ -85,10 +95,15 @@ DROPOUT = 0.1
 LABEL_SMOOTHING = 0.05
 EMA_DECAY = 0.99
 
-MIXUP_PROB = 0.5             # per batch
+# Both measured, both harmful here. Turning them on cost the ViT 0.052 and collapsed
+# resnet34 to 0.1272, where it predicted Benign for 210 of 212 images: the
+# class-weighted loss already corrects the imbalance, and a sampler plus mixup on top
+# of it, on 212 images and a few hundred optimizer steps, stops the model learning and
+# lets the doubled Benign bias take over.
+MIXUP_PROB = 0.0
 MIXUP_ALPHA = 0.4
-BALANCED_SAMPLER = True      # oversample Benign (52 vs 80/80)
-TTA_SCALES = (1.0, 0.9)      # combined with horizontal flip -> 4 views per image
+BALANCED_SAMPLER = False
+TTA_SCALES = (1.0,)          # with horizontal flip -> 2 views per image
 
 # Blend with a previous run's saved probabilities, e.g. the ViT run's
 # oof_vit.npy / test_prob_vit.npy. The blend weight is chosen on OOF, and the blend
@@ -248,25 +263,47 @@ class HFClassifier(nn.Module):
         return self.model(pixel_values=x).logits
 
 
-def param_groups(model, base_lr):
-    """Layer-wise LR decay, assigned by depth position.
+def _depth_of(name: str, max_stage: int) -> int:
+    """Map a parameter name to a depth index: 0 = stem, max_stage + 1 = head.
 
-    A 197M-parameter backbone pretrained on another modality should not have its early
-    generic filters moved at the same rate as its last stage, and the freshly
-    initialised head needs a far higher rate than either. Grouping by position in the
-    parameter order keeps this architecture-agnostic: it works for ConvNeXt stages and
-    ViT blocks alike without hard-coding module names.
+    Reads the stage/block number out of the module path, so it works for ConvNeXt
+    (`encoder.stages.N`) and ViT (`encoder.layer.N`) alike without hard-coding either.
     """
-    body = [(n, p) for n, p in model.named_parameters()
-            if p.requires_grad and "classifier" not in n]
-    head = [p for n, p in model.named_parameters() if p.requires_grad and "classifier" in n]
+    if "classifier" in name:
+        return max_stage + 1
+    m = re.search(r"stages?\.(\d+)\.", name) or re.search(r"layer\.(\d+)\.", name)
+    if m:
+        return int(m.group(1)) + 1
+    if "embed" in name or "stem" in name or "patch" in name:
+        return 0
+    return max_stage                      # final norm and anything else, treat as late
 
-    groups, n = [], max(len(body), 1)
-    for i, (_, p) in enumerate(body):
-        depth = i / n                      # 0 = earliest, 1 = latest
-        groups.append({"params": [p], "lr": base_lr * (LLRD ** (1.0 - depth) / LLRD)})
-    if head:
-        groups.append({"params": head, "lr": base_lr * HEAD_LR_MULT})
+
+def param_groups(model, base_lr):
+    """Layer-wise LR decay: early layers move slowly, the fresh head moves fastest.
+
+    A backbone pretrained on another modality should not have its early generic
+    filters moved at the same rate as its last stage. The decay spans LLRD ** depth,
+    so with LLRD 0.75 over five stages the stem trains at about a quarter of the last
+    stage's rate.
+    """
+    named = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
+    stages = [int(m.group(1)) for n, _ in named
+              for m in [re.search(r"stages?\.(\d+)\.", n) or re.search(r"layer\.(\d+)\.", n)]
+              if m]
+    max_stage = (max(stages) + 1) if stages else 1
+
+    buckets: dict[int, list] = {}
+    for n, p in named:
+        buckets.setdefault(_depth_of(n, max_stage), []).append(p)
+
+    groups = []
+    for depth in sorted(buckets):
+        if depth == max_stage + 1:
+            lr = base_lr * HEAD_LR_MULT   # freshly initialised, needs to catch up
+        else:
+            lr = base_lr * (LLRD ** (max_stage - depth))
+        groups.append({"params": buckets[depth], "lr": lr})
     return groups
 
 
@@ -319,7 +356,7 @@ def predict(model, images):
             out = []
             for xb in loader:
                 xb = xb.to(DEVICE)
-                with torch.amp.autocast("cuda", enabled=DEVICE == "cuda"):
+                with torch.amp.autocast("cuda", enabled=USE_AMP and DEVICE == "cuda"):
                     out.append(model(xb).softmax(1).float().cpu().numpy())
             p = np.concatenate(out)
             total = p if total is None else total + p
@@ -352,15 +389,26 @@ def train_fold(x_tr, y_tr, seed):
         loader = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True, drop_last=True,
                             num_workers=2, pin_memory=True)
 
+    # Head warmup: with a randomly initialised 3-way head, the first backward passes
+    # carry large, meaningless gradients. Holding the backbone still until the head is
+    # roughly calibrated keeps them out of 197M pretrained parameters.
+    def set_backbone_trainable(flag: bool) -> None:
+        for n, p in model.named_parameters():
+            if "classifier" not in n:
+                p.requires_grad_(flag)
+
     opt = torch.optim.AdamW(param_groups(model, LR), weight_decay=WEIGHT_DECAY)
-    steps = max(1, len(loader) // GRAD_ACCUM) * EPOCHS
+    steps = max(1, len(loader) // GRAD_ACCUM) * max(1, EPOCHS - WARMUP_EPOCHS)
     sched = torch.optim.lr_scheduler.OneCycleLR(
         opt, max_lr=[g["lr"] for g in opt.param_groups], total_steps=steps, pct_start=0.25)
     ema = EMA(model, EMA_DECAY)
-    scaler = torch.amp.GradScaler("cuda", enabled=DEVICE == "cuda")
-    n_steps = n_skipped = 0
+    amp = USE_AMP and DEVICE == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=amp)
+    n_ok = n_skip = 0
 
-    for _ in range(EPOCHS):
+    for epoch in range(EPOCHS):
+        warming = epoch < WARMUP_EPOCHS
+        set_backbone_trainable(not warming)
         model.train()
         opt.zero_grad(set_to_none=True)
         for step, (xb, yb) in enumerate(loader):
@@ -368,7 +416,7 @@ def train_fold(x_tr, y_tr, seed):
             use_mix = rng.random() < MIXUP_PROB and xb.size(0) > 1
             if use_mix:
                 xb, ya, yb2, lam = mixup(xb, yb, MIXUP_ALPHA, rng)
-            with torch.amp.autocast("cuda", enabled=DEVICE == "cuda"):
+            with torch.amp.autocast("cuda", enabled=amp):
                 logits = model(xb)
                 loss = (lam * crit(logits, ya) + (1 - lam) * crit(logits, yb2)) if use_mix \
                     else crit(logits, yb)
@@ -376,24 +424,27 @@ def train_fold(x_tr, y_tr, seed):
             scaler.scale(loss).backward()
             if (step + 1) % GRAD_ACCUM == 0:
                 scaler.unscale_(opt)
-                nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                nn.utils.clip_grad_norm_(
+                    [p for p in model.parameters() if p.requires_grad], 1.0)
                 scale_before = scaler.get_scale()
                 scaler.step(opt)
                 scaler.update()
                 opt.zero_grad(set_to_none=True)
-                # A dropped scale means GradScaler skipped this step (fp16 overflow);
-                # advancing the schedule or the EMA on a step that never happened is
+                # A dropped scale means GradScaler skipped this step (fp16 overflow).
+                # Advancing the schedule or the EMA on a step that never happened is
                 # how a run quietly ends up undertrained.
                 if scaler.get_scale() >= scale_before:
-                    if sched.last_epoch < steps - 1:
+                    if not warming and sched.last_epoch < steps - 1:
                         sched.step()
                     ema.update(model)
-                    n_steps += 1
+                    n_ok += 1
                 else:
-                    n_skipped += 1
-    if n_skipped > 0.1 * max(n_steps + n_skipped, 1):
-        print(f"    WARNING: fp16 overflow skipped {n_skipped}/{n_steps + n_skipped} "
-              f"optimizer steps -- lower LR or the fold will be undertrained", flush=True)
+                    n_skip += 1
+
+    set_backbone_trainable(True)
+    if n_skip > 0.1 * max(n_ok + n_skip, 1):
+        print(f"    WARNING: fp16 overflow skipped {n_skip}/{n_ok + n_skip} steps -- "
+              f"set USE_AMP = False", flush=True)
     ema.copy_to(model)
     return model
 
@@ -471,6 +522,19 @@ def try_blend(oof, test_prob, y):
     return best_oof, best_test
 
 
+def confidence_report(prob):
+    """Flag a fold that produced near-uniform probabilities.
+
+    A three-class softmax floors at 0.333. Two earlier runs scored a plausible-looking
+    macro F1 while sitting at a median max-prob under 0.42 -- they had not learned
+    anything, and only this told us so. A healthy fold sits near 0.7.
+    """
+    med = float(np.median(prob.max(1)))
+    flag = "   <-- NEAR-UNIFORM, this fold did not train" if med < 0.45 else ""
+    print(f"    confidence: median max-prob {med:.3f}, "
+          f"{(prob.max(1) > 0.5).mean():.0%} above 0.5{flag}", flush=True)
+
+
 def stage_1_zeroshot(x_train, y):
     print("=" * 70)
     print("STAGE 1 -- zero-shot sanity check (not a verdict: the ViT scored 0.19 here")
@@ -496,6 +560,8 @@ def main():
 
     print(f"device={DEVICE}  input={MODEL_H}x{MODEL_W}  folds={N_FOLDS}  seeds={SEEDS}")
     print(f"mixup={MIXUP_PROB}  balanced_sampler={BALANCED_SAMPLER}  tta_scales={TTA_SCALES}")
+    print(f"precision={'fp16' if USE_AMP else 'fp32'}  warmup_epochs={WARMUP_EPOCHS}  "
+          f"epochs={EPOCHS}  llrd={LLRD}")
     print(f"model={MODEL_ID}")
     print("\npreprocessing...", flush=True)
     x_train = build_cache(train.image_id, f"{DATA_DIR}/train_images")
