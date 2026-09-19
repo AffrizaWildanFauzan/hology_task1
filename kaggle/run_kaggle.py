@@ -55,7 +55,8 @@ N_FOLDS = 5
 SEEDS = [0, 1]                # repeated CV; more seeds = steadier estimate
 EPOCHS = 25
 BATCH_SIZE = 16
-LR = 3e-4
+LR = 1e-4                     # 3e-4 survived fp32 locally but produced a
+                              # near-uniform model under fp16 AMP on Kaggle
 WEIGHT_DECAY = 1e-2
 DROPOUT = 0.3
 LABEL_SMOOTHING = 0.05
@@ -304,6 +305,7 @@ def train_fold(x_tr, y_tr, seed):
                                                 pct_start=0.25)
     ema = EMA(model, EMA_DECAY)
     scaler = torch.amp.GradScaler("cuda", enabled=DEVICE == "cuda")
+    n_steps = n_skipped = 0
     for _ in range(EPOCHS):
         model.train()
         for xb, yb in loader:
@@ -314,10 +316,21 @@ def train_fold(x_tr, y_tr, seed):
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scale_before = scaler.get_scale()
             scaler.step(opt)
             scaler.update()
-            sched.step()
-            ema.update(model)
+            # A dropped scale means GradScaler skipped this step (fp16 overflow);
+            # advancing the schedule or the EMA on a step that never happened is how
+            # a run quietly ends up undertrained.
+            if scaler.get_scale() >= scale_before:
+                sched.step()
+                ema.update(model)
+                n_steps += 1
+            else:
+                n_skipped += 1
+    if n_skipped > 0.1 * max(n_steps + n_skipped, 1):
+        print(f"    WARNING: fp16 overflow skipped {n_skipped}/{n_steps + n_skipped} "
+              f"optimizer steps -- lower LR or the fold will be undertrained", flush=True)
     ema.copy_to(model)          # EMA weights generalise better at this sample size
     return model
 
@@ -345,6 +358,23 @@ def fit_weights(prob, y):
     return w / w.mean()
 
 
+def confidence_report(prob, label=""):
+    """Flag a fold that produced near-uniform probabilities.
+
+    A 3-class softmax floors at 0.333. A model that learned anything puts most of its
+    mass well above that; one that sits at ~0.39 did not train, however plausible its
+    macro F1 looks. Worth checking every fold, because the macro F1 of a barely-trained
+    model on 42 images can still land near 0.45 by luck.
+    """
+    med = float(np.median(prob.max(1)))
+    frac = float((prob.max(1) > 0.5).mean())
+    msg = f"    confidence{label}: median max-prob {med:.3f}, {frac:.0%} above 0.5"
+    if med < 0.45:
+        msg += "   <-- NEAR-UNIFORM, this fold did not train"
+    print(msg, flush=True)
+    return med
+
+
 def main():
     t0 = time.time()
     train = pd.read_csv(f"{DATA_DIR}/train.csv")
@@ -367,6 +397,7 @@ def main():
         for f, (tr, va) in enumerate(skf.split(y, y)):
             model = train_fold(x_train[tr], y[tr], seed * 100 + f)
             va_prob = predict(model, x_train[va])
+            confidence_report(va_prob)
             oof[va] += va_prob
             test_prob += predict(model, x_test)
             n_runs += 1
