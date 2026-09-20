@@ -449,6 +449,63 @@ dari kondisi pralatihnya, jadi 224 vs 384 vs 512 perlu diukur, bukan diasumsikan
 
 ---
 
+### 6.8 Jalur classical ML: fitur beku + SVM (`kaggle/run_kaggle_svm.py`)
+
+Tim menemukan notebook publik yang melaporkan **akurasi 0.95** dengan HOG + SVM pada
+citra payudara, dan meminta jalur itu dicoba. Jalurnya dibuat, tetapi angka 0.95 itu
+**tidak bisa dipindahkan ke soal ini**. Tiga alasan, semuanya terbaca langsung dari
+notebook tersebut:
+
+1. **Modalitas berbeda.** `path = '/kaggle/input/breast-ultrasound-images-dataset/Dataset_BUSI_with_GT'`
+   — itu BUSI, **ultrasound**. Data lomba ini FFDM (mammografi). Penampakan lesi,
+   rentang dinamis, dan artefak akuisisinya lain sama sekali.
+2. **Notebook itu memakai mask segmentasi ground-truth.** Di dalam `hog_extractor`:
+   `masked_image = cv2.bitwise_and(image, image, mask=mask)`. `mask` adalah anotasi
+   lesi yang ikut dikirim bersama BUSI. Jadi HOG-nya dihitung pada potongan lesi yang
+   **sudah ditemukan untuknya**. Bagian tersulit soal kita — menemukan lesi di dalam
+   citra 3540×4740 — persis bagian yang di notebook itu diberikan gratis. Panitia
+   tidak memberi kita mask apa pun.
+3. **Protokol validasinya berbeda dan lebih mudah.** `train_test_split(test_size=0.2,
+   random_state=0)` pada 399 citra yang sudah diseimbangkan ke 133/kelas — satu split
+   acak, bukan patient-disjoint. Milik kita 212 citra, patient-disjoint, macro F1.
+   Dua pertanyaan yang berbeda.
+
+Kesimpulannya: 0.95 itu bukan target yang sedang kita kejar-kejaran. Menyebutnya
+sebagai pembanding akan menyesatkan.
+
+**Yang tetap berguna dari jalur ini.** SVM pada fitur beku salah pada citra yang
+berbeda dibanding jaringan yang di-fine-tune — arsitektur beda, objektif beda, tidak
+ada gradien sama sekali di backbone. Dan blending dua model yang gagal berbeda adalah
+**satu-satunya tuas yang terukur membayar** di dataset ini (+0.07 OOF, §8.3). Jadi
+skrip ini dibuat sebagai **partner blend untuk run ViT**, bukan sebagai penggantinya.
+
+**Isi skrip:**
+
+| Tahap | Isi |
+|---|---|
+| Pra-proses | identik dengan `run_kaggle_vit.py` (crop payudara → CLAHE → 512×384), sehingga cache dan indeks barisnya bisa saling tukar |
+| Ekstraktor | HOG (metode notebook, tanpa mask), CLS+mean-patch dari `hugging-science/breast-cancer-detector-2`, `resnet50` ImageNet, `convnext_tiny` ImageNet — semuanya **beku**, `eval()`, `no_grad`, nol langkah gradien |
+| TTA fitur | rata-rata view asli dan flip horizontal |
+| Klasifier | `StandardScaler` → `PCA(96, whiten)` → `SVC(rbf/linear, class_weight='balanced', probability=True)` |
+| Pemilihan hyper-parameter | `GridSearchCV(scoring='f1_macro', cv=4)` **di dalam setiap fold luar** — grid tidak pernah melihat baris yang menilainya |
+| Blend | rata-rata probabilitas antar-feature-set, bobot dicari lalu diuji ulang cross-fitted; hanya dikirim kalau lolos |
+| Output | `oof_svm_{tag}.npy`, `test_svm_{tag}.npy`, `oof_svm.npy`, `test_svm.npy`, `submission_svm.csv` |
+
+**`classification_report` dan macro F1 dicetak di setiap tahap** — per feature set, untuk
+blend antar-feature-set, dan untuk blend dengan sumber eksternal — lengkap dengan
+confusion matrix.
+
+**Blok DIAGNOSTIC di akhir** menjalankan protokol notebook itu (satu split acak 80/20,
+43 baris uji) pada data kita, supaya selisihnya terlihat, bukan diperdebatkan. Angka
+dari 43 baris bergerak ±0.05 per satu citra; jangan dipakai memilih apa pun.
+
+**Kepatuhan aturan.** Tidak ada data eksternal. Backbone hanya dipakai sebagai
+ekstraktor fitur beku — checkpoint pralatih yang tersedia publik, yang secara eksplisit
+diizinkan aturan. Tidak ada LLM/VLM/AutoML/Ultralytics; `GridSearchCV` adalah pencarian
+grid pada satu estimator yang dipilih manusia, bukan AutoML yang memilih pipeline.
+
+---
+
 ## 7. Cara menjalankan
 
 ```bash
