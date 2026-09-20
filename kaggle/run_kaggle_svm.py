@@ -462,22 +462,38 @@ def main():
               f"SVM alone {solo:.4f}, blended cross-fitted {cf:.4f}")
         if cf > max(solo, ext_solo):
             w = fit_blend([oof, o_ext], y)
-            print(f"    -> shipping it, weights {np.round(w, 3)}")
+            print(f"    -> shipping the blend, weights {np.round(w, 3)}")
             oof = w[0] * oof + w[1] * o_ext
             test_prob = w[0] * test_prob + w[1] * t_ext
             report(y, oof.argmax(1), "classification report -- SVM + external (OOF)")
+        elif ext_solo > solo:
+            # The blend did not help, and the external source is the better of the
+            # two. Ship THAT, not the SVM. Shipping the weaker model because the
+            # blend failed would be worse than not running this script at all --
+            # which is exactly what an earlier version of this branch did.
+            print("    -> blend does not help, and the external source is stronger "
+                  "alone; shipping the external source unchanged")
+            oof, test_prob = o_ext, t_ext
+            report(y, oof.argmax(1), "classification report -- external alone (OOF)")
         else:
-            print("    -> does not beat the better of the two out-of-fold; not shipped")
+            print("    -> does not beat the SVM out-of-fold; keeping the SVM")
 
     np.save(f"{WORK}/oof_svm.npy", oof)
     np.save(f"{WORK}/test_svm.npy", test_prob)
 
     notebook_protocol_diagnostic(feats, y)
 
+    final_oof = f1_score(y, oof.argmax(1), average="macro")
     print("\n" + "=" * 68)
-    print(f"FINAL OOF macro F1 = {f1_score(y, oof.argmax(1), average='macro'):.4f}")
+    print(f"FINAL OOF macro F1 = {final_oof:.4f}")
     print("  ^ compare this against the ViT run's OOF, not against the public LB,")
     print("    which is scored on ~16 images.")
+    if final_oof < 0.45:
+        print("\n  *** DO NOT SUBMIT THIS FILE. ***")
+        print("  A three-class macro F1 floors around 0.333, so this is barely above")
+        print("  chance. Either a backbone failed to download (check the SKIPPED lines")
+        print("  above) or frozen features alone are not enough here. Set BLEND_WITH to")
+        print("  the ViT run's .npy files, or just submit the ViT run's own CSV.")
     print("=" * 68)
 
     sub = pd.DataFrame({"image_id": test.image_id,
