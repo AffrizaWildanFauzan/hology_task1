@@ -1,0 +1,13 @@
+# Core (audit + submission tooling run on these alone)
+numpy>=1.26
+pandas>=2.0
+opencv-python-headless>=4.9
+scikit-learn>=1.4
+Pillow>=10.0
+
+# Training
+torch>=2.2
+torchvision>=0.17
+# timm is optional: src/model.py uses it when present (wider backbone choice)
+# and falls back to torchvision otherwise.
+# timm>=1.0
